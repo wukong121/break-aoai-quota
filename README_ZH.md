@@ -1,128 +1,73 @@
-# Azure OpenAI 负载均衡解决方案 (APIM 智能代理)
+# Azure OpenAI 负载均衡与配额突破方案
 
-本项目提供了一个全自动化脚本，用于部署 **Azure API Management (APIM)** 作为 Azure OpenAI 服务的智能负载均衡器。该方案不仅可以聚合多个区域的 Azure OpenAI 资源实现高可用，还提供双协议支持（Azure 原生 SDK 与 OpenAI 官方 SDK 兼容）。
+本项目提供了一套综合解决方案，通过反向代理和负载均衡技术，突破单个 Azure 订阅对 Azure OpenAI 服务的配额限制。它能有效处理高并发场景下的 **429 (Too Many Requests)**、**500** 和 **503** 错误，确保业务稳定运行。
 
-## 🚀 核心优势
+## 🌟 核心功能
 
-*   **智能负载均衡**：自动将流量分配到多个 Azure OpenAI 后端实例（默认支持轮询 Round-Robin）。
-*   **高可用与韧性设计**：内置重试逻辑，当遇到 `429 Too Many Requests` 或 `5xx Server Errors` 时，API 管理服务会自动切换到下一个可用后端重试，极大减少业务中断。
-*   **双模式协议支持 (Dual API)**：
-    *   **Azure 原生 API (`/openai`)**：如 `https://<apim>.azure-api.net/openai`，完美兼容 Azure OpenAI Python/Node/C# SDK。
-    *   **OpenAI 兼容 API (`/v1`)**：如 `https://<apim>.azure-api.net/v1`，直接兼容 OpenAI 官方库，无需修改代码即可迁移应用。
-    *   **新增 Responses API 支持**：同时在 `/openai/responses` 和 `/v1/responses` 提供低延迟的 Responses API 访问（已内置版本重写逻辑）。
-*   **无密钥安全性 (Managed Identity)**：在 APIM 与后端 OpenAI 服务之间使用 **托管身份 (Managed Identity)** 通信，彻底消除在代码或 APIM 中明文存储 Backend Key 的安全风险。
-*   **多模型与长连接支持**：经验证支持 GPT-4o, Reasoning 模型 (o1-preview/gpt-5.2) 以及 DALL-E 3 (图片生成，已优化超时设置)。
-*   **跨订阅资源聚合**：支持配置不同 Azure 订阅下的 OpenAI 资源，实现跨订阅的高可用集群。
-
----
-
-## 🛠️ 前置要求
-
-*   **Python 3.10 及以上**
-*   **Azure CLI 登录** (`az login`)：确保拥有足够权限创建资源。
-*   **准备好的 Azure OpenAI 资源**：建议在不同区域（如美东 + 瑞典中部）创建同名模型部署，以获得最佳可用性。
+- **突破配额**：聚合多个 Azure OpenAI 资源/订阅的吞吐量，实现真正的线性扩展。
+- **智能重试**：针对 429、500、503 错误，自动将流量路由到健康的节点。
+- **负载均衡**：通过多种策略分配请求，避免单点过载。
+- **双部署模式**：
+  1. **Azure API Management (APIM)**：Azure 原生全托管解决方案。
+  2. **LiteLLM on AKS**：基于开源 LiteLLM 的高性价比 Kubernetes 部署方案。
 
 ## 📂 项目结构
 
-*   `deploy_aoai_nlb.py`: 核心部署脚本 (Python)，负责创建 APIM、API 定义以及策略配置。
-*   `azure-openai.json`: 配置文件，定义了后端资源列表、APIM 名称以及所需部署的模型。
-*   `test_apim.py`: 统一的测试工具，支持两种模式验证。
-*   `requirements.txt`: 项目 Python 依赖。
+### 1. Azure API Management (APIM)
+文件位于 [APIM/](./APIM/) 目录。
+
+该方案利用 Azure 原生 API 管理服务创建网关，统一管理后端 Azure OpenAI 节点。
+
+- **核心脚本**：`deploy_aoai_nlb.py` - 全自动化部署脚本。
+- **创建资源**：APIM 实例、Managed Identity、自定义 Policy。
+- **优势**：全托管服务，高可用，与 Azure 生态集成度高，无需维护底层设施。
+
+### 2. LiteLLM on AKS
+文件位于 [LiteLLM/](./LiteLLM/) 目录。
+
+该方案将开源的 [LiteLLM](https://github.com/BerriAI/litellm) 代理部署在 Azure Kubernetes Service (AKS) 上。所有组件通过 Managed Identity 进行安全隔离。
+
+- **核心脚本**：`deploy_mi_aks_litellm.py` - 全自动化部署脚本。
+- **创建资源**：AKS 集群、PostgreSQL（日志/状态存储）、负载均衡器、VMSS。
+- **优势**：高度可定制，社区活跃，性价比高（尤其是在小规模场景下）。
+
+## 💰 成本分析 (估算)
+
+以下是两种方案的月预估成本分析。价格基于 **East US 2** 区域（2026年参考价），实际费用可能随区域和使用量波动。
+
+### 方案 1: Azure API Management (Standard v2)
+
+部署脚本中默认使用了 APIM 的 **Standard v2** SKU，该 SKU 适用于流量较大的生产级负载（约 $700/月）。
+
+| 资源项 | SKU | 单价 (估算) | 用量 | 月费用 |
+| :--- | :--- | :--- | :--- | :--- |
+| **API Management** | Standard v2 | ~$0.96 / 小时 | 730 小时 | **~$700.00** |
+| **流量数据** | - | 极低 | - | (包含 50M API 请求/月) |
+| **合计** | | | | **~$700.00 / 月** |
+
+*注意：**Standard v2** 提供了 5000 万次/月的 API 请求配额。如果是小规模生产环境，您可以考虑修改部署脚本，将 SKU 改为 **Basic v2** (约 $150/月，包含 1000 万次请求/月)，以大幅降低成本。*
+
+### 方案 2: LiteLLM on AKS
+
+LiteLLM 方案部署了一个轻量级 AKS 集群。参数均在 `LiteLLM/deploy_mi_aks_litellm.py` 定义。
+
+*   **VM 规格**: `Standard_B2als_v2` (ARM64, 2 vCPU, 4GB RAM)
+*   **节点数**: 1
+
+| 资源项 | 规格 / SKU | 单价 (估算) | 月费用 |
+| :--- | :--- | :--- | :--- |
+| **AKS 集群管理** | 标准层 (SLA) | ~$0.10 / 小时 | ~$73.00 |
+| **虚拟机** | Standard_B2als_v2 | ~$0.023 / 小时 | ~$17.00 |
+| **托管磁盘** | Standard SSD (128GB) | ~$0.06 / GB | ~$8.00 |
+| **负载均衡器** | Standard Load Balancer | ~$0.025 / 小时 | ~$18.00 |
+| **公网 IP** | Standard Public IP | ~$0.005 / 小时 | ~$3.65 |
+| **合计** | | | **~$119.65 / 月** |
+
+### 总结
+
+- **最具性价比**：**LiteLLM on AKS** (~$120/月) 适合中小型规模或对成本敏感的场景。
+- **最省心维护**：**APIM** (~$700/月) 适合企业级生产环境，尤其是需要零服务器运维的场景。
 
 ---
 
-## ⚙️ 配置说明
-
-1.  **安装依赖**：
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-2.  **编辑配置文件 (`azure-openai.json`)**：
-    指定你的 APIM 名称、目标资源组、后端 OpenAI 实例列表。注意：`reverse_mode` 参数已废弃，脚本现默认同时部署两种模式。
-
-    ```json
-    {
-        "apim_name": "my-unique-apim-name",
-        "apim_resource_group": "my-resource-group",
-        "region": "eastus2",
-        "azure-openai-list": [
-            {
-                "name": "instance-eastus",
-                "endpoint": "https://instance-eastus.openai.azure.com/",
-                "resource_group": "rg-eastus"
-            },
-            {
-                "name": "instance-europe-sub2",
-                "endpoint": "https://instance-europe.openai.azure.com/",
-                "resource_group": "rg-europe",
-                "subscription_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  // 可选：指定资源所在的订阅 ID（如不填默认为当前）
-            }
-        ],
-        "deployment_list": [
-            { "model": "gpt-4o", "deployment_name": "gpt-4o" },
-            { "model": "gpt-image-1", "deployment_name": "dall-e-3" }
-        ]
-    }
-    ```
-
----
-
-## 📦 部署步骤
-
-直接运行 Python 部署脚本。该脚本会自动检查并创建 APIM 服务（如果不存在），配置后端池，应用负载均衡策略，并启用托管身份。
-
-```bash
-python deploy_aoai_nlb.py
-```
-
-*注意：首次创建 APIM 服务可能需要 30-45 分钟。更新 API 配置通常只需几秒钟。*
-
-**脚本执行细节：**
-1.  创建 APIM 服务 (Standard V2 SKU)。
-2.  为 APIM 启用用户分配托管身份 (User-Assigned Managed Identity)，并自动为后端 OpenAI 资源分配 `Cognitive Services OpenAI User` 角色（支持跨订阅）。
-3.  **注意**：角色分配现在使用确定性 GUID 来防止冲突并支持幂等性。
-4.  创建两个 API 入口：
-    *   `/openai` (Azure Mode + Responses API)
-    *   `/v1` (OpenAI Compatible Mode)
-
----
-
-## 🧪 测试与验证
-
-部署完成后，脚本会输出 **Gateway URL**。请前往 Azure Portal (API Management -> Subscriptions) 获取 **Subscription Key**。
-
-使用提供的 `test_apim.py` 脚本验证部署是否成功。
-
-### 1. 测试 Azure 原生模式
-模拟 Azure OpenAI SDK，测试 `/openai/deployments/...` 路径。
-
-```bash
-python test_apim.py \
-  --mode azure \
-  --url "https://<your-apim-name>.azure-api.net/" \
-  --key "<subscription-key>"
-```
-
-### 2. 测试 OpenAI 兼容模式
-模拟标准 OpenAI SDK，测试 `/v1/chat/completions` 路径（无需 Azure Endpoint，仅需 Base URL）。
-
-```bash
-python test_apim.py \
-  --mode openai \
-  --url "https://<your-apim-name>.azure-api.net/" \
-  --key "<subscription-key>"
-```
-
----
-
-## 📝 策略与技术细节
-
-本方案部署了高级 XML 策略 (Policy)，主要功能包括：
-
-1.  **后端轮询 (Backend Rotation)**：使用随机算法选择健康的后端。
-2.  **故障转移 (Retry Strategy)**：
-    *   当后端返回 `429` (限流) 或 `5xx` (服务端错误) 时自动重试。
-    *   采用指数退避算法 (Exponential Backoff)。
-3.  **身份认证 (Transformation)**：移除客户端传入的 API Key，自动注入 APIM 的 Managed Identity Token (`Authorization: Bearer <token>`) 与后端通信。
-4.  **路由重写 (OpenAI Mode)**：动态将 `/v1/chat/completions` 请求映射为 Azure 特有的 `/openai/deployments/{model}/chat/completions?api-version=...` 格式。
+*免责声明：以上价格仅供参考，不作为最终计费依据。最新定价请访问 [Azure 定价计算器](https://azure.microsoft.com/zh-cn/pricing/calculator/)。*
