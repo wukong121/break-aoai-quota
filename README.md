@@ -31,6 +31,46 @@ This solution deploys [LiteLLM](https://github.com/BerriAI/litellm), an open-sou
 - **Key File**: `deploy_mi_aks_litellm.py` - Automated deployment script.
 - **Resources Created**: AKS Cluster, PostgreSQL, Load Balancer.
 
+## 💰 Cost Analysis (Estimated)
+
+Below is an estimated monthly cost analysis for both solutions. Prices are based on the **East US 2** region (as of 2026) and may vary by region and actual usage.
+
+### Option 1: Azure API Management (Standard v2)
+
+The APIM deployment script uses the **Standard v2** SKU.
+
+| Resource | SKU | Unit Price (Est.) | Quantity | Monthly Cost |
+| :--- | :--- | :--- | :--- | :--- |
+| **API Management** | Standard v2 | ~$0.96 / hour | 730 hours | **~$700.00** |
+| **Traffic Data** | - | Varied | - | (Minimal for text) |
+| **Total** | | | | **~$700.00 / month** |
+
+*Note: The **Standard v2** tier is designed for production workloads with higher throughput limits (approx. 50M requests/month included). If this exceeds your budget, you may consider modifying the script to use **Basic v2** (~$150/month), provided its limits (10M requests/month) meet your requirements.*
+
+### Option 2: LiteLLM on AKS
+
+The LiteLLM solution deploys a lightweight AKS cluster. The parameters are defined in `LiteLLM/deploy_mi_aks_litellm.py`.
+*   **VM Size**: `Standard_B2als_v2` (ARM64, 2 vCPU, 4GB RAM)
+*   **Node Count**: 1
+
+| Resource | Spec / SKU | Unit Price (Est.) | Monthly Cost |
+| :--- | :--- | :--- | :--- |
+| **AKS Cluster Management** | Standard Tier (SLA) | ~$0.10 / hour | ~$73.00 |
+| **Virtual Machine** | Standard_B2als_v2 | ~$0.023 / hour | ~$17.00 |
+| **Managed Disk** | Standard SSD (128GB) | ~$0.06 / GB | ~$8.00 |
+| **Load Balancer** | Standard Load Balancer | ~$0.025 / hour | ~$18.00 |
+| **Public IP** | Standard Public IP | ~$0.005 / hour | ~$3.65 |
+| **Total** | | | **~$119.65 / month** |
+
+### Summary
+
+- **Lowest Cost**: **LiteLLM on AKS** (~$120/mo) is generally more cost-effective for smaller scale or standard throughput needs.
+- **Lowest Maintenance**: **APIM** (~$700/mo) requires zero OS/Cluster management.
+
+---
+
+*Disclaimer: Prices are estimates only and subject to change by Microsoft Azure. Please check the [Azure Pricing Calculator](https://azure.microsoft.com/en-us/pricing/calculator/) for the most accurate current pricing.*
+
 ## ⚙️ Quick Start
 
 **1. Install Global Dependencies:**
