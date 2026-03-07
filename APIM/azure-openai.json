@@ -1,49 +1,41 @@
 {
-    "apim_name":"micl-aoai-nlb",
-    "apim_resource_group":"aoai-nlb-rg",
-    "region":"eastus2",
-    "azure-openai-list":[
+    "apim_name": "your-apim-name-here",
+    "apim_resource_group": "your-resource-group-here",
+    "region": "eastus2",
+    "azure-openai-list": [
         {
-            "name":"micl-eastus2",
-            "endpoint":"https://<name>.openai.azure.com/",
-            "resource_group":"OpenAI"
+            "name": "your-instance-1",
+            "endpoint": "https://your-instance-1.openai.azure.com/",
+            "resource_group": "your-rg-1"
         },
         {
-            "name":"micl-swedencentral",
-            "endpoint":"https://<name>.openai.azure.com/",
-            "resource_group":"OpenAI"
+            "name": "your-instance-2",
+            "endpoint": "https://your-instance-2.openai.azure.com/",
+            "resource_group": "your-rg-2"
         },
         {
-            "name":"micl-eastus-2",
-            "endpoint":"https://<name>.openai.azure.com/",
-            "resource_group":"OpenAI",
-            "subscription_id":""
+            "name": "your-instance-3",
+            "endpoint": "https://your-instance-3.openai.azure.com/",
+            "resource_group": "your-rg-3",
+            "subscription_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
         }
     ],
-    "deployment_list":[
+    "deployment_list": [
         {
-            "model":"gpt-4o",
-            "deployment_name":"gpt-4o"
+            "model": "gpt-4o",
+            "deployment_name": "gpt-4o"
         },
         {
-            "model":"gpt-4o-mini",
-            "deployment_name":"gpt-4o-mini"
+            "model": "gpt-4o-mini",
+            "deployment_name": "gpt-4o-mini"
         },
         {
-            "model":"gpt-5.2",
-            "deployment_name":"gpt-5.2"
+            "model": "gpt-image-1",
+            "deployment_name": "gpt-image-1"
         },
         {
-            "model":"gpt-5.2-chat",
-            "deployment_name":"gpt-5.2-chat"
-        },
-        {
-            "model":"gpt-5.1-codex",
-            "deployment_name":"gpt-5.1-codex"
-        },
-        {
-            "model":"gpt-image-1",
-            "deployment_name":"gpt-image-1"
+            "model": "sora-2",
+            "deployment_name": "sora-2"
         }
     ]
 }

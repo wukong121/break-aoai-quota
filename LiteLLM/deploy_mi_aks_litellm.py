@@ -429,7 +429,15 @@ def generate_litellm_config(cfg: dict[str, Any]) -> str:
     for deployment in deployments:
         model = deployment["model"]
         deployment_name = deployment["deployment_name"]
-        alias = f"aoai-{deployment_name}"
+        alias = deployment_name
+
+        # Decide API version based on model name
+        model_low = model.lower()
+        if model_low.startswith(("gpt-image-", "dall-e", "sora")):
+            resolved_api_version = "2025-04-01-preview"
+        else:
+            # Let's try matching the test script's expectation of standard endpoints vs responses api
+            resolved_api_version = "2025-04-01-preview"
 
         for resource in resources:
             endpoint = resource.get("endpoint", "")
@@ -444,7 +452,7 @@ def generate_litellm_config(cfg: dict[str, Any]) -> str:
                     "base_model": model,
                     "deployment_id": deployment_name,
                     "api_base": endpoint,
-                    "api_version": "os.environ/AZURE_API_VERSION",
+                    "api_version": resolved_api_version,
                 },
             })
 
@@ -584,7 +592,7 @@ def run_smoke_test(
     azure_api_version: str,
 ) -> bool:
     """Run smoke tests against LiteLLM proxy."""
-    log("Running smoke tests for Responses API (OpenAI + Azure OpenAI style)")
+    log("Running smoke tests for Chat API (OpenAI + Azure OpenAI style)")
 
     headers = {
         "Authorization": f"Bearer {master_key}",
@@ -592,27 +600,27 @@ def run_smoke_test(
     }
     payload = {
         "model": model_alias,
-        "input": "reply only: ok",
-        "max_output_tokens": 32,
+        "messages": [{"role": "user", "content": "reply only: ok"}],
+        "max_tokens": 32,
     }
 
     # Test OpenAI-style endpoint
     try:
         resp = requests.post(
-            f"{base_url}/v1/responses",
+            f"{base_url}/v1/chat/completions",
             headers=headers,
             json=payload,
             timeout=60,
         )
         if not resp.ok:
-            log(f"OpenAI-style /v1/responses failed. status={resp.status_code}", "ERROR")
+            log(f"OpenAI-style /v1/chat/completions failed. status={resp.status_code}", "ERROR")
             return False
     except Exception as e:
-        log(f"OpenAI-style /v1/responses failed: {e}", "ERROR")
+        log(f"OpenAI-style /v1/chat/completions failed: {e}", "ERROR")
         return False
 
     # Test Azure-style endpoint
-    azure_url = f"{base_url}/openai/v1/responses"
+    azure_url = f"{base_url}/openai/deployments/{model_alias}/chat/completions"
     if azure_api_version:
         azure_url += f"?api-version={azure_api_version}"
 
@@ -624,13 +632,13 @@ def run_smoke_test(
             timeout=60,
         )
         if not resp.ok:
-            log(f"Azure-style /openai/v1/responses failed. status={resp.status_code}", "ERROR")
+            log(f"Azure-style chat format failed. status={resp.status_code}", "ERROR")
             return False
     except Exception as e:
-        log(f"Azure-style /openai/v1/responses failed: {e}", "ERROR")
+        log(f"Azure-style chat format failed: {e}", "ERROR")
         return False
 
-    log("Smoke test passed: /v1/responses and /openai/v1/responses are both available")
+    log("Smoke test passed: /v1/chat/completions and Azure-style chat are both available")
     return True
 
 
@@ -785,7 +793,7 @@ def main():
     # Step 10: Smoke test
     if settings["run_smoke_test"] and external_ip:
         first_deployment = cfg["deployment_list"][0]["deployment_name"]
-        model_alias = f"aoai-{first_deployment}"
+        model_alias = first_deployment
 
         # Wait a bit for service to be reachable
         time.sleep(10)

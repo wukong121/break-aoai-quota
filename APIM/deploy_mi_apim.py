@@ -318,18 +318,17 @@ class AzureDeploymentManager:
                 <set-variable name="requestBody" value='@(context.Request.Body.As&lt;JObject&gt;(preserveContent: true))' />
                 <set-variable name="model" value='@((string)((JObject)context.Variables["requestBody"])["model"])' />
                 
-                <!-- Rewrite URI to Azure Format for Responses: /openai/responses?api-version=2025-01-01-preview -->
-                <!-- Assuming the backend is already pointing to /openai, we just need /responses -->
-                <!-- But wait, if backend includes /openai prefix (as per configure_backends method) -->
-                <!-- The backend URL is defined as: endpoint.rstrip('/') + "/openai" -->
-                <!-- So if APIM appends the path from request... -->
-                <!-- If request is /v1/responses (OpenAI mode), APIM might append /responses? -->
-                <!-- Actually, we are rewriting URI here explicitly. -->
-                
-                <!-- Target: {backend}/responses?api-version=... -->
                 <rewrite-uri template="/responses" />
                 <set-query-parameter name="api-version" exists-action="override">
                     <value>2025-04-01-preview</value>
+                </set-query-parameter>
+            </when>
+
+            <!-- Models list -->
+            <when condition='@(context.Request.OriginalUrl.Path.EndsWith("/models") &amp;&amp; context.Request.Method == "GET")'>
+                <rewrite-uri template="/models" />
+                <set-query-parameter name="api-version" exists-action="override">
+                    <value>2024-02-15-preview</value>
                 </set-query-parameter>
             </when>
         </choose>
@@ -366,8 +365,8 @@ class AzureDeploymentManager:
         <set-backend-service backend-id='@((string)context.Variables["selectedBackend"])' />
     </inbound>
     <backend>
-        <!-- Retry Policy for 429 and 5xx -->
-        <retry condition="@(context.Response.StatusCode == 429 || context.Response.StatusCode >= 500)" count="2" interval="0" first-fast-retry="true">
+        <!-- Retry Policy for 429, 500, and 503 -->
+        <retry condition="@(context.Response.StatusCode == 429 || context.Response.StatusCode == 500 || context.Response.StatusCode == 503)" count="2" interval="0" first-fast-retry="true">
             <!-- 轮询切换到下一个 Backend -->
             <set-variable name="backendIndex" value='@(((int)context.Variables["backendIndex"] + 1) % {len(backend_ids)})' />
             <set-variable name="selectedBackend" value='@((string)((JArray)context.Variables["backends"])[(int)context.Variables["backendIndex"]])' />
@@ -468,50 +467,55 @@ class AzureDeploymentManager:
             logger.info(f"Configuring operations for {api_id}...")
             
             # 1. 针对 deployment_list 创建 Operation (/deployments/{name}/...)
-            #    这对 Azure 模式是必需的。对 OpenAI 模式，虽然主要用 rewrite，但保留也不冲突，或者可以只为 Azure 模式创建。
-            #    为了简单兼容，我们在两种模式下都创建标准路径，OpenAI 模式额外通过 Policy 重写 /chat/completions。
-            
-            for dep in self.config['deployment_list']:
-                model_name = dep['model']
-                dep_name = dep['deployment_name']
-                
-                # Determine operation type based on model name
-                if "image" in model_name.lower() or "dall-e" in model_name.lower():
-                    # Image Generation
-                    op_id = f"image-{dep_name}".replace(".", "-").replace(" ", "-")
-                    url_template = f"/deployments/{dep_name}/images/generations"
-                    display_name = f"Image Generation ({dep_name})"
-                    method = "POST"
-                elif "embedding" in model_name.lower():
-                    # Embeddings
-                    op_id = f"embed-{dep_name}".replace(".", "-").replace(" ", "-")
-                    url_template = f"/deployments/{dep_name}/embeddings"
-                    display_name = f"Embeddings ({dep_name})"
-                    method = "POST"
-                else:
-                    # Default to Chat Completion
-                    # Use 'chat-' prefix to match previous deployment and update in-place
-                    op_id = f"chat-{dep_name}".replace(".", "-").replace(" ", "-")
-                    url_template = f"/deployments/{dep_name}/chat/completions"
-                    display_name = f"Chat Completion ({dep_name})"
-                    method = "POST"
-                
-                try:
-                    self.apim_client.api_operation.create_or_update(
-                        rg_name, apim_name, api_id, op_id,
-                        parameters=OperationContract(
-                            display_name=display_name,
-                            method=method,
-                            url_template=url_template,
-                            description=f"Proxy for model {model_name}"
-                        )
-                    )
+            #    这对 Azure 模式是必需的。由于 OpenAI 模式不需要暴露 Azure 的部署结构，因此在此剔除。
+            #    特别地，Sora 模型不需要暴露 openai.com 格式，因此天然不会在 OpenAI 模式下被创建相应的接口。
+            if not is_openai_mode:
+                for dep in self.config['deployment_list']:
+                    model_name = dep['model']
+                    dep_name = dep['deployment_name']
                     
-                except Exception as e:
-                    logger.warning(f"Failed to create/update op {op_id}: {e}")
-                    # If failure is due to conflict (e.g. changing type), try deleting first?
-                    # But usually ID stability prevents this unless URL changed for same ID.
-                    pass
+                    # Determine operation type based on model name
+                    if "image" in model_name.lower() or "dall-e" in model_name.lower():
+                        # Image Generation
+                        op_id = f"image-{dep_name}".replace(".", "-").replace(" ", "-")
+                        url_template = f"/deployments/{dep_name}/images/generations"
+                        display_name = f"Image Generation ({dep_name})"
+                        method = "POST"
+                    elif "sora" in model_name.lower() or "video" in model_name.lower():
+                        # Sora Video Generation / Models
+                        # Video generation endpoint depends on capability, typically /video/generations
+                        op_id = f"sora-{dep_name}".replace(".", "-").replace(" ", "-")
+                        url_template = f"/deployments/{dep_name}/*"
+                        display_name = f"Sora Model ({dep_name})"
+                        method = "POST"
+                    elif "embedding" in model_name.lower():
+                        # Embeddings
+                        op_id = f"embed-{dep_name}".replace(".", "-").replace(" ", "-")
+                        url_template = f"/deployments/{dep_name}/embeddings"
+                        display_name = f"Embeddings ({dep_name})"
+                        method = "POST"
+                    else:
+                        # Default to Chat Completion
+                        # Use 'chat-' prefix to match previous deployment and update in-place
+                        op_id = f"chat-{dep_name}".replace(".", "-").replace(" ", "-")
+                        url_template = f"/deployments/{dep_name}/chat/completions"
+                        display_name = f"Chat Completion ({dep_name})"
+                        method = "POST"
+                    
+                    try:
+                        self.apim_client.api_operation.create_or_update(
+                            rg_name, apim_name, api_id, op_id,
+                            parameters=OperationContract(
+                                display_name=display_name,
+                                method=method,
+                                url_template=url_template,
+                                description=f"Proxy for model {model_name}"
+                            )
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to create/update op {op_id}: {e}")
+                        # If failure is due to conflict (e.g. changing type), try deleting first
+                        pass
 
             # 2. 如果是 OpenAI 模式，显式添加 Standard Operations
             if is_openai_mode:
@@ -545,6 +549,17 @@ class AzureDeploymentManager:
                         method="POST",
                         url_template="/responses",
                         description="Access response models via 'model' body parameter"
+                    )
+                )
+                
+                # Models Registry Check
+                self.apim_client.api_operation.create_or_update(
+                    rg_name, apim_name, api_id, "openai-models",
+                    parameters=OperationContract(
+                        display_name="OpenAI Models",
+                        method="GET",
+                        url_template="/models",
+                        description="Access models registry"
                     )
                 )
             

@@ -1,0 +1,24 @@
+# =============================================================================
+# Break AOAI Quota - Project Dependencies
+# =============================================================================
+
+# Utilities & Testing
+openai>=1.12.0
+requests>=2.31.0
+pyyaml>=6.0
+
+# Azure SDK for Python - General & Management Libraries
+azure-identity>=1.15.0
+azure-mgmt-resource>=23.0.0
+azure-mgmt-subscription>=3.1.0
+azure-mgmt-msi>=7.0.0
+azure-mgmt-authorization>=4.0.0
+
+# Azure SDK for Python - Specific Services
+azure-mgmt-apimanagement
+azure-mgmt-cognitiveservices>=13.5.0
+azure-mgmt-containerservice>=29.0.0
+azure-mgmt-compute>=30.0.0
+
+# Kubernetes Python Client
+kubernetes>=29.0.0
