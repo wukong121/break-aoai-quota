@@ -1,12 +1,12 @@
 import os
 import sys
 import json
-import time
 import logging
+import re
 import uuid
-import random
+from urllib.parse import urlparse
 from azure.identity import DefaultAzureCredential, InteractiveBrowserCredential
-from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError, HttpResponseError
+from azure.core.exceptions import ResourceNotFoundError
 from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.msi import ManagedServiceIdentityClient
 from azure.mgmt.authorization import AuthorizationManagementClient
@@ -15,13 +15,12 @@ from azure.mgmt.apimanagement.models import (
     ApiManagementServiceResource,
     ApiCreateOrUpdateParameter,
     BackendContract,
-    BackendCredentialsContract,
-    BackendProperties,
     PolicyContract,
     ApiManagementServiceIdentity,
     UserIdentityProperties,
     ResourceSku,
     OperationContract,
+    ParameterContract,
     SubscriptionKeyParameterNamesContract
 )
 
@@ -33,10 +32,17 @@ logger = logging.getLogger(__name__)
 # "Cognitive Services OpenAI User" Role ID
 OPENAI_USER_ROLE_ID = "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd"
 IDENTITY_NAME = "aoai-nlb-identity"
+AZURE_CHAT_API_VERSION = "2024-10-21"
+AZURE_EMBEDDINGS_API_VERSION = "2024-10-21"
+AZURE_IMAGES_API_VERSION = "2025-04-01-preview"
+AZURE_RESPONSES_PREVIEW_API_VERSION = "2025-04-01-preview"
+ROUND_ROBIN_CACHE_KEY = "aoai-apim-round-robin-index"
 
 class AzureDeploymentManager:
     def __init__(self, config_file="azure-openai.json"):
         self.config = self._load_config(config_file)
+        self.model_alias_map = self.build_model_alias_map(self.config['deployment_list'])
+        self.identity_client_id = None
         
         # 尝试使用 DefaultAzureCredential (支持环境变量, Managed Identity, Azure CLI 等)
         # 并显式添加 InteractiveBrowserCredential 作为后备选项，以便在本地未登录 CLI 时弹出浏览器登录
@@ -77,10 +83,346 @@ class AzureDeploymentManager:
     def _load_config(self, config_file):
         try:
             with open(config_file, 'r') as f:
-                return json.load(f)
+                config = json.load(f)
+                self.validate_config(config)
+                return config
         except Exception as e:
             logger.error(f"Failed to load config file: {e}")
             raise
+
+    @staticmethod
+    def validate_config(config):
+        if not isinstance(config, dict):
+            raise ValueError("Config file must contain a JSON object.")
+
+        for key in ("apim_name", "apim_resource_group", "region"):
+            value = config.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Config field '{key}' must be a non-empty string.")
+
+        aoai_resources = config.get('azure-openai-list')
+        if not isinstance(aoai_resources, list) or not aoai_resources:
+            raise ValueError("Config field 'azure-openai-list' must be a non-empty list.")
+
+        for index, aoai in enumerate(aoai_resources):
+            if not isinstance(aoai, dict):
+                raise ValueError(f"Azure OpenAI resource entry #{index + 1} must be an object.")
+
+            for key in ("name", "endpoint", "resource_group"):
+                value = aoai.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"Azure OpenAI resource entry #{index + 1} is missing '{key}'.")
+
+            endpoint = aoai['endpoint'].strip()
+            parsed = urlparse(endpoint)
+            if parsed.scheme != "https" or not parsed.netloc.endswith(".openai.azure.com"):
+                raise ValueError(
+                    f"Azure OpenAI resource entry #{index + 1} has an invalid endpoint: {endpoint}"
+                )
+
+            subscription_id = aoai.get('subscription_id')
+            if subscription_id is not None and (not isinstance(subscription_id, str) or not subscription_id.strip()):
+                raise ValueError(
+                    f"Azure OpenAI resource entry #{index + 1} has an invalid 'subscription_id'."
+                )
+
+        deployments = config.get('deployment_list')
+        if not isinstance(deployments, list) or not deployments:
+            raise ValueError("Config field 'deployment_list' must be a non-empty list.")
+
+        seen_deployments = set()
+        model_to_deployment = {}
+
+        for index, deployment in enumerate(deployments):
+            if not isinstance(deployment, dict):
+                raise ValueError(f"Deployment entry #{index + 1} must be an object.")
+
+            model = deployment.get('model')
+            deployment_name = deployment.get('deployment_name')
+
+            if not isinstance(model, str) or not model.strip():
+                raise ValueError(f"Deployment entry #{index + 1} is missing 'model'.")
+
+            if not isinstance(deployment_name, str) or not deployment_name.strip():
+                raise ValueError(f"Deployment entry #{index + 1} is missing 'deployment_name'.")
+
+            model = model.strip()
+            deployment_name = deployment_name.strip()
+
+            if deployment_name in seen_deployments:
+                raise ValueError(f"Duplicate deployment_name detected: {deployment_name}")
+            seen_deployments.add(deployment_name)
+
+            existing = model_to_deployment.get(model)
+            if existing and existing != deployment_name:
+                raise ValueError(
+                    f"Ambiguous OpenAI-compatible model mapping for '{model}': "
+                    f"'{existing}' and '{deployment_name}'."
+                )
+            model_to_deployment[model] = deployment_name
+
+    @staticmethod
+    def build_model_alias_map(deployments):
+        alias_map = {}
+        for deployment in deployments:
+            model = deployment['model'].strip()
+            deployment_name = deployment['deployment_name'].strip()
+            if model != deployment_name:
+                alias_map[model] = deployment_name
+        return alias_map
+
+    @staticmethod
+    def _escape_csharp_string(value):
+        return value.replace('\\', '\\\\').replace('"', '\\"')
+
+    def _build_model_resolution_policy(self, request_model_var="requestModel", resolved_var="deploymentName"):
+        policy_lines = [
+            f"<set-variable name=\"{resolved_var}\" value='@((string)context.Variables[\"{request_model_var}\"])' />"
+        ]
+
+        if not self.model_alias_map:
+            return "\n".join(policy_lines)
+
+        policy_lines.append("<choose>")
+        for model_alias, deployment_name in sorted(self.model_alias_map.items()):
+            alias = self._escape_csharp_string(model_alias)
+            resolved = self._escape_csharp_string(deployment_name)
+            policy_lines.append(
+                f"<when condition='@((string)context.Variables[\"{request_model_var}\"] == \"{alias}\")'>"
+            )
+            policy_lines.append(
+                f"    <set-variable name=\"{resolved_var}\" value=\"{resolved}\" />"
+            )
+            policy_lines.append("</when>")
+        policy_lines.append("</choose>")
+        return "\n".join(policy_lines)
+
+    @staticmethod
+    def _build_backend_selection_policy(backend_ids, index_var="backendIndex"):
+        if not backend_ids:
+            raise ValueError("At least one backend is required to generate the APIM policy.")
+
+        policy_lines = ["<choose>"]
+        for index, backend_id in enumerate(backend_ids[:-1]):
+            policy_lines.append(
+                f"<when condition='@((int)context.Variables[\"{index_var}\"] == {index})'>"
+            )
+            policy_lines.append(
+                f"    <set-variable name=\"selectedBackend\" value=\"{backend_id}\" />"
+            )
+            policy_lines.append("</when>")
+
+        policy_lines.append("<otherwise>")
+        policy_lines.append(
+            f"    <set-variable name=\"selectedBackend\" value=\"{backend_ids[-1]}\" />"
+        )
+        policy_lines.append("</otherwise>")
+        policy_lines.append("</choose>")
+        return "\n".join(policy_lines)
+
+    def _build_api_operations(self, is_openai_mode):
+        operations = []
+
+        if is_openai_mode:
+            operations.extend([
+                {
+                    "id": "openai-chat-completions",
+                    "display_name": "OpenAI Chat Completions",
+                    "method": "POST",
+                    "url_template": "/chat/completions",
+                    "description": "Access chat models via 'model' body parameter"
+                },
+                {
+                    "id": "openai-embeddings",
+                    "display_name": "OpenAI Embeddings",
+                    "method": "POST",
+                    "url_template": "/embeddings",
+                    "description": "Access embedding models via 'model' body parameter"
+                },
+                {
+                    "id": "openai-images-generations",
+                    "display_name": "OpenAI Image Generations",
+                    "method": "POST",
+                    "url_template": "/images/generations",
+                    "description": "Access image models via 'model' body parameter"
+                },
+                {
+                    "id": "openai-responses-create",
+                    "display_name": "OpenAI Responses",
+                    "method": "POST",
+                    "url_template": "/responses",
+                    "description": "Create a response via the OpenAI-compatible API"
+                },
+                {
+                    "id": "openai-responses-get",
+                    "display_name": "OpenAI Retrieve Response",
+                    "method": "GET",
+                    "url_template": "/responses/{responseId}",
+                    "description": "Retrieve a response via the OpenAI-compatible API"
+                },
+                {
+                    "id": "openai-responses-delete",
+                    "display_name": "OpenAI Delete Response",
+                    "method": "DELETE",
+                    "url_template": "/responses/{responseId}",
+                    "description": "Delete a stored response via the OpenAI-compatible API"
+                },
+                {
+                    "id": "openai-responses-input-items",
+                    "display_name": "OpenAI Response Input Items",
+                    "method": "GET",
+                    "url_template": "/responses/{responseId}/input_items",
+                    "description": "List response input items via the OpenAI-compatible API"
+                },
+                {
+                    "id": "openai-models",
+                    "display_name": "OpenAI Models",
+                    "method": "GET",
+                    "url_template": "/models",
+                    "description": "Access models registry via the OpenAI-compatible API"
+                },
+            ])
+        else:
+            for deployment in self.config['deployment_list']:
+                model_name = deployment['model']
+                deployment_name = deployment['deployment_name']
+                model_name_lower = model_name.lower()
+
+                if "image" in model_name_lower or "dall-e" in model_name_lower:
+                    operations.append({
+                        "id": f"image-{deployment_name}".replace(".", "-").replace(" ", "-"),
+                        "display_name": f"Image Generation ({deployment_name})",
+                        "method": "POST",
+                        "url_template": f"/deployments/{deployment_name}/images/generations",
+                        "description": f"Proxy for model {model_name}"
+                    })
+                elif "sora" in model_name_lower or "video" in model_name_lower:
+                    operations.append({
+                        "id": f"sora-{deployment_name}".replace(".", "-").replace(" ", "-"),
+                        "display_name": f"Sora Model ({deployment_name})",
+                        "method": "POST",
+                        "url_template": f"/deployments/{deployment_name}/*",
+                        "description": f"Proxy for model {model_name}"
+                    })
+                elif "embedding" in model_name_lower:
+                    operations.append({
+                        "id": f"embed-{deployment_name}".replace(".", "-").replace(" ", "-"),
+                        "display_name": f"Embeddings ({deployment_name})",
+                        "method": "POST",
+                        "url_template": f"/deployments/{deployment_name}/embeddings",
+                        "description": f"Proxy for model {model_name}"
+                    })
+                else:
+                    operations.append({
+                        "id": f"chat-{deployment_name}".replace(".", "-").replace(" ", "-"),
+                        "display_name": f"Chat Completion ({deployment_name})",
+                        "method": "POST",
+                        "url_template": f"/deployments/{deployment_name}/chat/completions",
+                        "description": f"Proxy for model {model_name}"
+                    })
+
+            operations.extend([
+                {
+                    "id": "azure-responses-preview-create",
+                    "display_name": "Azure Responses API (Preview)",
+                    "method": "POST",
+                    "url_template": "/responses",
+                    "description": "Create a response via Azure OpenAI preview responses API"
+                },
+                {
+                    "id": "azure-responses-preview-get",
+                    "display_name": "Azure Retrieve Response (Preview)",
+                    "method": "GET",
+                    "url_template": "/responses/{responseId}",
+                    "description": "Retrieve a response via Azure OpenAI preview responses API"
+                },
+                {
+                    "id": "azure-responses-preview-delete",
+                    "display_name": "Azure Delete Response (Preview)",
+                    "method": "DELETE",
+                    "url_template": "/responses/{responseId}",
+                    "description": "Delete a stored response via Azure OpenAI preview responses API"
+                },
+                {
+                    "id": "azure-responses-preview-input-items",
+                    "display_name": "Azure Response Input Items (Preview)",
+                    "method": "GET",
+                    "url_template": "/responses/{responseId}/input_items",
+                    "description": "List preview response input items via Azure OpenAI"
+                },
+                {
+                    "id": "azure-responses-v1-create",
+                    "display_name": "Azure Responses API (v1)",
+                    "method": "POST",
+                    "url_template": "/v1/responses",
+                    "description": "Create a response via Azure OpenAI v1 responses API"
+                },
+                {
+                    "id": "azure-responses-v1-get",
+                    "display_name": "Azure Retrieve Response (v1)",
+                    "method": "GET",
+                    "url_template": "/v1/responses/{responseId}",
+                    "description": "Retrieve a response via Azure OpenAI v1 responses API"
+                },
+                {
+                    "id": "azure-responses-v1-delete",
+                    "display_name": "Azure Delete Response (v1)",
+                    "method": "DELETE",
+                    "url_template": "/v1/responses/{responseId}",
+                    "description": "Delete a stored response via Azure OpenAI v1 responses API"
+                },
+                {
+                    "id": "azure-responses-v1-input-items",
+                    "display_name": "Azure Response Input Items (v1)",
+                    "method": "GET",
+                    "url_template": "/v1/responses/{responseId}/input_items",
+                    "description": "List v1 response input items via Azure OpenAI"
+                },
+                {
+                    "id": "azure-models-v1",
+                    "display_name": "Azure Models (v1)",
+                    "method": "GET",
+                    "url_template": "/v1/models",
+                    "description": "Access the Azure OpenAI v1 models registry"
+                },
+            ])
+
+        operations.append({
+            "id": "wildcard-post",
+            "display_name": "Wildcard POST Operation",
+            "method": "POST",
+            "url_template": "/*",
+            "description": "Matches unmatched POST requests"
+        })
+        return operations
+
+    def _create_or_update_operation(self, rg_name, apim_name, api_id, operation):
+        template_parameters = [
+            ParameterContract(
+                name=parameter_name,
+                type="string",
+                required=True,
+                description=f"Path parameter '{parameter_name}'"
+            )
+            for parameter_name in re.findall(r"\{([^}]+)\}", operation['url_template'])
+        ]
+
+        try:
+            self.apim_client.api_operation.create_or_update(
+                rg_name,
+                apim_name,
+                api_id,
+                operation['id'],
+                parameters=OperationContract(
+                    display_name=operation['display_name'],
+                    method=operation['method'],
+                    url_template=operation['url_template'],
+                    template_parameters=template_parameters,
+                    description=operation['description']
+                )
+            )
+        except Exception as e:
+            logger.warning(f"Failed to create/update op {operation['id']}: {e}")
 
     def create_resource_group(self):
         """创建或确认资源组"""
@@ -232,7 +574,6 @@ class AzureDeploymentManager:
         """配置 APIM Backends (Backend pool for Load Balancing)"""
         rg_name = self.config['apim_resource_group']
         apim_name = self.config['apim_name']
-        client_id = identity.client_id
         
         backend_ids = []
         
@@ -272,64 +613,191 @@ class AzureDeploymentManager:
     def create_load_balancing_policy_xml(self, backend_ids, is_openai_mode=False):
         """
         核心反向代理策略:
-        1. 负载均衡: 随机选择 Backend
+        1. 负载均衡: 使用缓存计数器执行 Round Robin
         2. 容错: 遇到 429/5xx 重试并切换 Backend
         3. 兼容性: (可选) 如果是 OpenAI 模式，重写 URI 和 Body
         """
-        # 生成 C# 数组初始化逻辑
-        backend_add_statements = ""
-        for bid in backend_ids:
-            backend_add_statements += f'backends.Add("{bid}");\n            '
-        
-        # 兼容性逻辑：如果是 OpenAI 模式，针对 /chat/completions 进行重写
+        backend_selection_policy = self._build_backend_selection_policy(backend_ids)
+        model_resolution_policy = self._build_model_resolution_policy()
+
         openai_compat_section = ""
         if is_openai_mode:
-            # Note: Using single quotes for XML attribute values to allow double quotes in C# expressions
-            # Also escaping < and > to &lt; and &gt; for XML compliance inside attributes
-            openai_compat_section = """
-        <!-- OpenAI Compatibility: Rewrite URI and Body for Chat & Image Completions -->
+            openai_compat_section = f"""
+        <!-- OpenAI Compatibility: rewrite friendly model aliases to Azure deployment routes -->
         <choose>
-            <!-- Chat Completions -->
             <when condition='@(context.Request.OriginalUrl.Path.EndsWith("/chat/completions"))'>
-                <set-variable name="requestBody" value='@(context.Request.Body.As&lt;JObject&gt;(preserveContent: true))' />
-                <set-variable name="model" value='@((string)((JObject)context.Variables["requestBody"])["model"])' />
-                
-                <!-- Rewrite URI to Azure Format: /deployments/{model}/chat/completions?api-version=2024-02-15-preview -->
-                <rewrite-uri template='@("/deployments/" + (string)context.Variables["model"] + "/chat/completions")' />
+                <set-variable name="requestModel" value='@{{
+                    var requestBody = context.Request.Body.As&lt;JObject&gt;(preserveContent: true);
+                    return requestBody?["model"]?.ToString() ?? string.Empty;
+                }}' />
+                <choose>
+                    <when condition='@(string.IsNullOrEmpty((string)context.Variables["requestModel"]))'>
+                        <return-response>
+                            <set-status code="400" reason="Bad Request" />
+                            <set-header name="Content-Type" exists-action="override">
+                                <value>application/json</value>
+                            </set-header>
+                            <set-body>{{"error": {{"message": "Request body must include a non-empty model field."}}}}</set-body>
+                        </return-response>
+                    </when>
+                </choose>
+                {model_resolution_policy}
+                <set-body>@{{
+                    var requestBody = context.Request.Body.As&lt;JObject&gt;(preserveContent: true);
+                    requestBody["model"] = (string)context.Variables["deploymentName"];
+                    return requestBody.ToString();
+                }}</set-body>
+                <rewrite-uri template='@("/deployments/" + (string)context.Variables["deploymentName"] + "/chat/completions")' />
                 <set-query-parameter name="api-version" exists-action="override">
-                    <value>2024-02-15-preview</value>
+                    <value>{AZURE_CHAT_API_VERSION}</value>
                 </set-query-parameter>
             </when>
-            
-            <!-- Image Generations (DALL-E) -->
+
+            <when condition='@(context.Request.OriginalUrl.Path.EndsWith("/embeddings"))'>
+                <set-variable name="requestModel" value='@{{
+                    var requestBody = context.Request.Body.As&lt;JObject&gt;(preserveContent: true);
+                    return requestBody?["model"]?.ToString() ?? string.Empty;
+                }}' />
+                <choose>
+                    <when condition='@(string.IsNullOrEmpty((string)context.Variables["requestModel"]))'>
+                        <return-response>
+                            <set-status code="400" reason="Bad Request" />
+                            <set-header name="Content-Type" exists-action="override">
+                                <value>application/json</value>
+                            </set-header>
+                            <set-body>{{"error": {{"message": "Request body must include a non-empty model field."}}}}</set-body>
+                        </return-response>
+                    </when>
+                </choose>
+                {model_resolution_policy}
+                <set-body>@{{
+                    var requestBody = context.Request.Body.As&lt;JObject&gt;(preserveContent: true);
+                    requestBody["model"] = (string)context.Variables["deploymentName"];
+                    return requestBody.ToString();
+                }}</set-body>
+                <rewrite-uri template='@("/deployments/" + (string)context.Variables["deploymentName"] + "/embeddings")' />
+                <set-query-parameter name="api-version" exists-action="override">
+                    <value>{AZURE_EMBEDDINGS_API_VERSION}</value>
+                </set-query-parameter>
+            </when>
+
             <when condition='@(context.Request.OriginalUrl.Path.EndsWith("/images/generations"))'>
-                <set-variable name="requestBody" value='@(context.Request.Body.As&lt;JObject&gt;(preserveContent: true))' />
-                <set-variable name="model" value='@((string)((JObject)context.Variables["requestBody"])["model"])' />
-                
-                <!-- Rewrite URI to Azure Format: /deployments/{model}/images/generations?api-version=2024-02-01 -->
-                <rewrite-uri template='@("/deployments/" + (string)context.Variables["model"] + "/images/generations")' />
+                <set-variable name="requestModel" value='@{{
+                    var requestBody = context.Request.Body.As&lt;JObject&gt;(preserveContent: true);
+                    return requestBody?["model"]?.ToString() ?? string.Empty;
+                }}' />
+                <choose>
+                    <when condition='@(string.IsNullOrEmpty((string)context.Variables["requestModel"]))'>
+                        <return-response>
+                            <set-status code="400" reason="Bad Request" />
+                            <set-header name="Content-Type" exists-action="override">
+                                <value>application/json</value>
+                            </set-header>
+                            <set-body>{{"error": {{"message": "Request body must include a non-empty model field."}}}}</set-body>
+                        </return-response>
+                    </when>
+                </choose>
+                {model_resolution_policy}
+                <set-body>@{{
+                    var requestBody = context.Request.Body.As&lt;JObject&gt;(preserveContent: true);
+                    requestBody["model"] = (string)context.Variables["deploymentName"];
+                    return requestBody.ToString();
+                }}</set-body>
+                <rewrite-uri template='@("/deployments/" + (string)context.Variables["deploymentName"] + "/images/generations")' />
                 <set-query-parameter name="api-version" exists-action="override">
-                    <value>2024-02-01</value>
+                    <value>{AZURE_IMAGES_API_VERSION}</value>
                 </set-query-parameter>
             </when>
 
-            <!-- Responses API (Corrected per user requirement) -->
-            <when condition='@(context.Request.OriginalUrl.Path.EndsWith("/responses"))'>
-                <set-variable name="requestBody" value='@(context.Request.Body.As&lt;JObject&gt;(preserveContent: true))' />
-                <set-variable name="model" value='@((string)((JObject)context.Variables["requestBody"])["model"])' />
-                
-                <rewrite-uri template="/responses" />
+            <when condition='@(context.Request.Method == "POST" &amp;&amp; context.Request.OriginalUrl.Path.EndsWith("/responses"))'>
+                <set-variable name="requestModel" value='@{{
+                    var requestBody = context.Request.Body.As&lt;JObject&gt;(preserveContent: true);
+                    return requestBody?["model"]?.ToString() ?? string.Empty;
+                }}' />
+                <choose>
+                    <when condition='@(string.IsNullOrEmpty((string)context.Variables["requestModel"]))'>
+                        <return-response>
+                            <set-status code="400" reason="Bad Request" />
+                            <set-header name="Content-Type" exists-action="override">
+                                <value>application/json</value>
+                            </set-header>
+                            <set-body>{{"error": {{"message": "Request body must include a non-empty model field."}}}}</set-body>
+                        </return-response>
+                    </when>
+                </choose>
+                {model_resolution_policy}
+                <set-body>@{{
+                    var requestBody = context.Request.Body.As&lt;JObject&gt;(preserveContent: true);
+                    requestBody["model"] = (string)context.Variables["deploymentName"];
+                    return requestBody.ToString();
+                }}</set-body>
+                <rewrite-uri template='@(context.Request.OriginalUrl.Path)' />
+            </when>
+
+            <when condition='@(context.Request.OriginalUrl.Path.Contains("/responses/") || (context.Request.Method == "GET" &amp;&amp; context.Request.OriginalUrl.Path.EndsWith("/models")))'>
+                <rewrite-uri template='@(context.Request.OriginalUrl.Path)' />
+            </when>
+        </choose>
+            """
+        else:
+            openai_compat_section = f"""
+        <!-- Azure native responses compatibility: support preview /openai/responses and v1 /openai/v1/responses -->
+        <choose>
+            <when condition='@(context.Request.Method == "POST" &amp;&amp; context.Request.OriginalUrl.Path.EndsWith("/responses"))'>
+                <set-variable name="requestModel" value='@{{
+                    var requestBody = context.Request.Body.As&lt;JObject&gt;(preserveContent: true);
+                    return requestBody?["model"]?.ToString() ?? string.Empty;
+                }}' />
+                <choose>
+                    <when condition='@(string.IsNullOrEmpty((string)context.Variables["requestModel"]))'>
+                        <return-response>
+                            <set-status code="400" reason="Bad Request" />
+                            <set-header name="Content-Type" exists-action="override">
+                                <value>application/json</value>
+                            </set-header>
+                            <set-body>{{"error": {{"message": "Request body must include a non-empty model field."}}}}</set-body>
+                        </return-response>
+                    </when>
+                </choose>
+                {model_resolution_policy}
+                <set-body>@{{
+                    var requestBody = context.Request.Body.As&lt;JObject&gt;(preserveContent: true);
+                    requestBody["model"] = (string)context.Variables["deploymentName"];
+                    return requestBody.ToString();
+                }}</set-body>
                 <set-query-parameter name="api-version" exists-action="override">
-                    <value>2025-04-01-preview</value>
+                    <value>{AZURE_RESPONSES_PREVIEW_API_VERSION}</value>
                 </set-query-parameter>
             </when>
 
-            <!-- Models list -->
-            <when condition='@(context.Request.OriginalUrl.Path.EndsWith("/models") &amp;&amp; context.Request.Method == "GET")'>
-                <rewrite-uri template="/models" />
+            <when condition='@(context.Request.OriginalUrl.Path.Contains("/responses/") &amp;&amp; !context.Request.OriginalUrl.Path.Contains("/v1/responses/"))'>
                 <set-query-parameter name="api-version" exists-action="override">
-                    <value>2024-02-15-preview</value>
+                    <value>{AZURE_RESPONSES_PREVIEW_API_VERSION}</value>
                 </set-query-parameter>
+            </when>
+
+            <when condition='@(context.Request.Method == "POST" &amp;&amp; context.Request.OriginalUrl.Path.Contains("/v1/responses"))'>
+                <set-variable name="requestModel" value='@{{
+                    var requestBody = context.Request.Body.As&lt;JObject&gt;(preserveContent: true);
+                    return requestBody?["model"]?.ToString() ?? string.Empty;
+                }}' />
+                <choose>
+                    <when condition='@(string.IsNullOrEmpty((string)context.Variables["requestModel"]))'>
+                        <return-response>
+                            <set-status code="400" reason="Bad Request" />
+                            <set-header name="Content-Type" exists-action="override">
+                                <value>application/json</value>
+                            </set-header>
+                            <set-body>{{"error": {{"message": "Request body must include a non-empty model field."}}}}</set-body>
+                        </return-response>
+                    </when>
+                </choose>
+                {model_resolution_policy}
+                <set-body>@{{
+                    var requestBody = context.Request.Body.As&lt;JObject&gt;(preserveContent: true);
+                    requestBody["model"] = (string)context.Variables["deploymentName"];
+                    return requestBody.ToString();
+                }}</set-body>
             </when>
         </choose>
             """
@@ -349,19 +817,19 @@ class AzureDeploymentManager:
             <value>@("Bearer " + (string)context.Variables["msi-access-token"])</value>
         </set-header>
 
-        <!-- Load Balancing Configuration -->
-        <!-- 定义所有可用后端 -->
-        <set-variable name="backends" value='@{{
-            JArray backends = new JArray();
-            {backend_add_statements}
-            return backends;
+        <!-- Round Robin selection backed by APIM cache -->
+        <cache-lookup-value key="{ROUND_ROBIN_CACHE_KEY}" variable-name="cachedBackendIndex" />
+        <set-variable name="backendIndex" value='@{{
+            var cachedValue = context.Variables.ContainsKey("cachedBackendIndex") ? (string)context.Variables["cachedBackendIndex"] : "0";
+            int currentIndex = 0;
+            if (!int.TryParse(cachedValue, out currentIndex))
+            {{
+                currentIndex = 0;
+            }}
+            return ((currentIndex % {len(backend_ids)}) + {len(backend_ids)}) % {len(backend_ids)};
         }}' />
-        
-        <!-- 随机选择初始 Backend -->
-        <set-variable name="backendIndex" value="@(new Random().Next(0, {len(backend_ids)}))" />
-        <set-variable name="selectedBackend" value='@((string)((JArray)context.Variables["backends"])[(int)context.Variables["backendIndex"]])' />
-        
-        <!-- 应用 Backend -->
+        <cache-store-value key="{ROUND_ROBIN_CACHE_KEY}" value='@((((int)context.Variables["backendIndex"] + 1) % {len(backend_ids)}).ToString())' duration="86400" />
+        {backend_selection_policy}
         <set-backend-service backend-id='@((string)context.Variables["selectedBackend"])' />
     </inbound>
     <backend>
@@ -369,7 +837,7 @@ class AzureDeploymentManager:
         <retry condition="@(context.Response.StatusCode == 429 || context.Response.StatusCode == 500 || context.Response.StatusCode == 503)" count="2" interval="0" first-fast-retry="true">
             <!-- 轮询切换到下一个 Backend -->
             <set-variable name="backendIndex" value='@(((int)context.Variables["backendIndex"] + 1) % {len(backend_ids)})' />
-            <set-variable name="selectedBackend" value='@((string)((JArray)context.Variables["backends"])[(int)context.Variables["backendIndex"]])' />
+            {backend_selection_policy}
             <set-backend-service backend-id='@((string)context.Variables["selectedBackend"])' />
             <!-- Increased timeout to 120s for DALL-E and Reasoning models -->
             <forward-request buffer-request-body="true" timeout="120" />
@@ -463,132 +931,10 @@ class AzureDeploymentManager:
                 parameters=PolicyContract(value=policy_xml, format="xml")
             )
             
-            # 创建 Operations
             logger.info(f"Configuring operations for {api_id}...")
-            
-            # 1. 针对 deployment_list 创建 Operation (/deployments/{name}/...)
-            #    这对 Azure 模式是必需的。由于 OpenAI 模式不需要暴露 Azure 的部署结构，因此在此剔除。
-            #    特别地，Sora 模型不需要暴露 openai.com 格式，因此天然不会在 OpenAI 模式下被创建相应的接口。
-            if not is_openai_mode:
-                for dep in self.config['deployment_list']:
-                    model_name = dep['model']
-                    dep_name = dep['deployment_name']
-                    
-                    # Determine operation type based on model name
-                    if "image" in model_name.lower() or "dall-e" in model_name.lower():
-                        # Image Generation
-                        op_id = f"image-{dep_name}".replace(".", "-").replace(" ", "-")
-                        url_template = f"/deployments/{dep_name}/images/generations"
-                        display_name = f"Image Generation ({dep_name})"
-                        method = "POST"
-                    elif "sora" in model_name.lower() or "video" in model_name.lower():
-                        # Sora Video Generation / Models
-                        # Video generation endpoint depends on capability, typically /video/generations
-                        op_id = f"sora-{dep_name}".replace(".", "-").replace(" ", "-")
-                        url_template = f"/deployments/{dep_name}/*"
-                        display_name = f"Sora Model ({dep_name})"
-                        method = "POST"
-                    elif "embedding" in model_name.lower():
-                        # Embeddings
-                        op_id = f"embed-{dep_name}".replace(".", "-").replace(" ", "-")
-                        url_template = f"/deployments/{dep_name}/embeddings"
-                        display_name = f"Embeddings ({dep_name})"
-                        method = "POST"
-                    else:
-                        # Default to Chat Completion
-                        # Use 'chat-' prefix to match previous deployment and update in-place
-                        op_id = f"chat-{dep_name}".replace(".", "-").replace(" ", "-")
-                        url_template = f"/deployments/{dep_name}/chat/completions"
-                        display_name = f"Chat Completion ({dep_name})"
-                        method = "POST"
-                    
-                    try:
-                        self.apim_client.api_operation.create_or_update(
-                            rg_name, apim_name, api_id, op_id,
-                            parameters=OperationContract(
-                                display_name=display_name,
-                                method=method,
-                                url_template=url_template,
-                                description=f"Proxy for model {model_name}"
-                            )
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to create/update op {op_id}: {e}")
-                        # If failure is due to conflict (e.g. changing type), try deleting first
-                        pass
 
-            # 2. 如果是 OpenAI 模式，显式添加 Standard Operations
-            if is_openai_mode:
-                # Chat Completions
-                self.apim_client.api_operation.create_or_update(
-                    rg_name, apim_name, api_id, "openai-chat-completions",
-                    parameters=OperationContract(
-                        display_name="OpenAI Chat Completions",
-                        method="POST",
-                        url_template="/chat/completions",
-                        description="Access chat models via 'model' body parameter"
-                    )
-                )
-                
-                # Image Generations
-                self.apim_client.api_operation.create_or_update(
-                    rg_name, apim_name, api_id, "openai-images-generations",
-                    parameters=OperationContract(
-                        display_name="OpenAI Image Generations",
-                        method="POST",
-                        url_template="/images/generations",
-                        description="Access image models via 'model' body parameter"
-                    )
-                )
-
-                # Responses
-                self.apim_client.api_operation.create_or_update(
-                    rg_name, apim_name, api_id, "openai-responses",
-                    parameters=OperationContract(
-                        display_name="OpenAI Responses",
-                        method="POST",
-                        url_template="/responses",
-                        description="Access response models via 'model' body parameter"
-                    )
-                )
-                
-                # Models Registry Check
-                self.apim_client.api_operation.create_or_update(
-                    rg_name, apim_name, api_id, "openai-models",
-                    parameters=OperationContract(
-                        display_name="OpenAI Models",
-                        method="GET",
-                        url_template="/models",
-                        description="Access models registry"
-                    )
-                )
-            
-            # 3. Wildcard Operation
-            self.apim_client.api_operation.create_or_update(
-                rg_name, apim_name, api_id, "wildcard-all",
-                parameters=OperationContract(
-                    display_name="Wildcard Operation",
-                    method="POST",
-                    url_template="/*",
-                    description="Matches all other requests"
-                )
-            )
-            
-            # 4. Global Responses Operation (Native Azure)
-            # Only create this global operation if we are NOT in OpenAI mode (to avoid conflict with openai-responses)
-            if not is_openai_mode:
-                try:
-                    self.apim_client.api_operation.create_or_update(
-                        rg_name, apim_name, api_id, "global-responses",
-                        parameters=OperationContract(
-                            display_name="Global Responses API",
-                            method="POST",
-                            url_template="/responses",
-                            description="Access Responses API (global)"
-                        )
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to create global responses op: {e}")
+            for operation in self._build_api_operations(is_openai_mode=is_openai_mode):
+                self._create_or_update_operation(rg_name, apim_name, api_id, operation)
 
             created_apis.append(api_path)
 
@@ -628,6 +974,16 @@ class AzureDeploymentManager:
         logger.info("Deployed APIs:")
         for path in created_paths:
             logger.info(f"  - /{path} (e.g. {gateway_url}/{path}/...)")
+
+        logger.info("Example endpoints:")
+        logger.info(f"  - OpenAI Chat: {gateway_url}/v1/chat/completions")
+        logger.info(f"  - OpenAI Embeddings: {gateway_url}/v1/embeddings")
+        logger.info(f"  - OpenAI Images: {gateway_url}/v1/images/generations")
+        logger.info(f"  - OpenAI Responses: {gateway_url}/v1/responses")
+        logger.info(f"  - Azure Chat: {gateway_url}/openai/deployments/<deployment>/chat/completions?api-version={AZURE_CHAT_API_VERSION}")
+        logger.info(f"  - Azure Images: {gateway_url}/openai/deployments/<deployment>/images/generations?api-version={AZURE_IMAGES_API_VERSION}")
+        logger.info(f"  - Azure Responses (preview): {gateway_url}/openai/responses?api-version={AZURE_RESPONSES_PREVIEW_API_VERSION}")
+        logger.info(f"  - Azure Responses (v1): {gateway_url}/openai/v1/responses")
             
         logger.info(f"Managed Identity Client ID: {identity.client_id}")
         
