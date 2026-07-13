@@ -4,7 +4,7 @@
 
 ## 测试文件说明
 
-- `test_all_deployments_all.py`: 统一的端到端网络测试脚本，同时兼容发往 LiteLLM 或 APIM 代理的大型语言模型验证。验证能力涵盖文本、图片和视频模型的可用性，同时覆盖了对标准 OpenAI API 格式以及 Azure OpenAI API 格式路由的请求兼容。
+- `test_all_deployments.py`: 统一的端到端网络测试脚本，同时兼容发往 LiteLLM 或 APIM 代理的大型语言模型验证。验证能力涵盖文本、图片和视频模型的可用性，同时覆盖了对标准 OpenAI API 格式以及 Azure OpenAI API 格式路由的请求兼容。
 
 ## 环境要求
 
@@ -17,7 +17,7 @@
 需要提供针对不同代理的部署配置 `azure-openai.json` 文件的路径、代理服务的基础 URL (Base URL) 以及访问该代理服务的对应 API Key。
 
 ```bash
-python test_all_deployments_all.py \
+python test_all_deployments.py \
   --config ../LiteLLM/azure-openai.json \
   --base-url http://<GATEWAY_EXTERNAL_IP_OR_DOMAIN>:<PORT> \
   --api-key <YOUR_GATEWAY_API_KEY>

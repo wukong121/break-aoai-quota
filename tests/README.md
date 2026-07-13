@@ -4,7 +4,7 @@ This directory contains the testing scripts used to validate the deployment and 
 
 ## Files
 
-- `test_all_deployments_all.py`: A unified end-to-end testing script that evaluates the routing and functionality for both LiteLLM and APIM deployments. It tests standard OpenAI Format and Azure OpenAI Format across text, image, and video models.
+- `test_all_deployments.py`: A unified end-to-end testing script that evaluates the routing and functionality for both LiteLLM and APIM deployments. It tests standard OpenAI Format and Azure OpenAI Format across text, image, and video models.
 
 ## Requirements
 
@@ -17,7 +17,7 @@ Ensure your environment is set up and your proxy is running. The scripts only us
 You will need the `azure-openai.json` configuration file, the Base URL of the proxy, and the configured API Key.
 
 ```bash
-python test_all_deployments_all.py \
+python test_all_deployments.py \
   --config ../LiteLLM/azure-openai.json \
   --base-url http://<GATEWAY_EXTERNAL_IP_OR_DOMAIN>:<PORT> \
   --api-key <YOUR_GATEWAY_API_KEY>

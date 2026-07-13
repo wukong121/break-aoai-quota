@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -29,9 +30,21 @@ from azure.mgmt.authorization import AuthorizationManagementClient
 from azure.mgmt.authorization.models import RoleAssignmentCreateParameters
 from azure.mgmt.cognitiveservices import CognitiveServicesManagementClient
 from azure.mgmt.compute import ComputeManagementClient
+from azure.mgmt.compute.models import VirtualMachineScaleSetIdentity, VirtualMachineScaleSetUpdate
 from azure.mgmt.containerservice import ContainerServiceClient
 from azure.mgmt.msi import ManagedServiceIdentityClient
-from azure.mgmt.resource import ResourceManagementClient
+try:
+    from azure.mgmt.resource import ResourceManagementClient
+except ImportError:
+    # azure-mgmt-resource 26.x moved the sync client under .resources.
+    from azure.mgmt.resource.resources import ResourceManagementClient
+from azure.mgmt.containerservice.models import (
+    ManagedCluster,
+    ManagedClusterAgentPoolProfile,
+    ManagedClusterIdentity,
+    ManagedClusterProperties,
+    ManagedClusterSKU,
+)
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 from kubernetes.client.rest import ApiException
@@ -45,7 +58,7 @@ DEFAULT_CONFIG = {
     "mi_name": os.environ.get("MI_NAME", "litellm-managed-identity"),
     "aks_name": os.environ.get("AKS_NAME", "litellm-mi-aks"),
     "aks_node_count": int(os.environ.get("AKS_NODE_COUNT", "1")),
-    "aks_vm_size": os.environ.get("AKS_VM_SIZE", "Standard_B2als_v2"),
+    "aks_vm_size": os.environ.get("AKS_VM_SIZE", "Standard_B2s"),
     "aks_namespace": os.environ.get("AKS_NAMESPACE", "litellm"),
     "litellm_image": os.environ.get("LITELLM_IMAGE", "micl/litellm:mi-fix-image-gen"),
     "litellm_master_key": os.environ.get("LITELLM_MASTER_KEY", "sk-local-mi-test-key"),
@@ -91,15 +104,29 @@ def extract_resource_name_from_endpoint(endpoint: str) -> Optional[str]:
 
 
 def get_subscription_id() -> str:
-    """Get the current Azure subscription ID."""
-    credential = DefaultAzureCredential()
-    from azure.mgmt.subscription import SubscriptionClient
-    sub_client = SubscriptionClient(credential)
-    subs = list(sub_client.subscriptions.list())
-    if not subs:
-        raise RuntimeError("No Azure subscriptions found")
-    return subs[0].subscription_id
+    """Resolve the Azure subscription used for the AKS deployment."""
+    subscription_id = os.environ.get("AZURE_SUBSCRIPTION_ID", "").strip()
+    if subscription_id:
+        return subscription_id
 
+    try:
+        subscription_id = subprocess.check_output(
+            ["az", "account", "show", "--query", "id", "-o", "tsv"],
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(
+            "Cannot determine Azure subscription. "
+            "Set AZURE_SUBSCRIPTION_ID or run az login."
+        ) from exc
+
+    if subscription_id:
+        return subscription_id
+
+    raise RuntimeError(
+        "Cannot determine Azure subscription. "
+        "Set AZURE_SUBSCRIPTION_ID or run az login."
+    )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Azure Resource Management
@@ -163,20 +190,22 @@ class AzureResourceManager:
             poller = self.aks_client.managed_clusters.begin_create_or_update(
                 resource_group,
                 name,
-                {
-                    "location": location,
-                    "dns_prefix": f"{name}-dns",
-                    "agent_pool_profiles": [
-                        {
-                            "name": "nodepool1",
-                            "count": node_count,
-                            "vm_size": vm_size,
-                            "mode": "System",
-                        }
-                    ],
-                    "identity": {"type": "SystemAssigned"},
-                    "sku": {"name": "Base", "tier": "Standard"},
-                }
+                ManagedCluster(
+                    location=location,
+                    properties=ManagedClusterProperties(
+                        dns_prefix=f"{name}-dns",
+                        agent_pool_profiles=[
+                            ManagedClusterAgentPoolProfile(
+                                name="nodepool1",
+                                count=node_count,
+                                vm_size=vm_size,
+                                mode="System",
+                            )
+                        ],
+                    ),
+                    identity=ManagedClusterIdentity(type="SystemAssigned"),
+                    sku=ManagedClusterSKU(name="Base", tier="Standard"),
+                )
             )
             cluster = poller.result()
             log(f"Created AKS cluster: {name}")
@@ -190,8 +219,9 @@ class AzureResourceManager:
         """Fetch AKS credentials and configure kubectl."""
         log("Fetching AKS credentials")
         # Use az CLI for kubeconfig merge (SDK doesn't directly support this)
+        az_command = shutil.which("az.cmd") or shutil.which("az") or "az"
         subprocess.run(
-            ["az", "aks", "get-credentials", "--name", name, "--resource-group", resource_group, "--overwrite-existing"],
+            [az_command, "aks", "get-credentials", "--name", name, "--resource-group", resource_group, "--overwrite-existing"],
             check=True,
             capture_output=True,
         )
@@ -218,12 +248,12 @@ class AzureResourceManager:
         poller = self.compute_client.virtual_machine_scale_sets.begin_update(
             resource_group,
             vmss_name,
-            {
-                "identity": {
-                    "type": identity_type,
-                    "user_assigned_identities": user_identities,
-                }
-            }
+            VirtualMachineScaleSetUpdate(
+                identity=VirtualMachineScaleSetIdentity(
+                    type=identity_type,
+                    user_assigned_identities=user_identities,
+                )
+            ),
         )
         poller.result()
         log(f"Verified: MI is attached to VMSS.")
@@ -804,9 +834,9 @@ def main():
 
     # Step 11: Print summary
     print()
-    print("═" * 63)
+    print("=" * 63)
     print("  LiteLLM Proxy — Deployment Complete")
-    print("═" * 63)
+    print("=" * 63)
     print()
     print(f"  Web UI URL        : {base_url}/ui")
     print(f"  Web UI Username   : admin")
@@ -820,7 +850,7 @@ def main():
     print(f"  Namespace         : {settings['aks_namespace']}")
     print(f"  Database          : PostgreSQL (in-cluster)")
     print()
-    print("═" * 63)
+    print("=" * 63)
 
 
 if __name__ == "__main__":

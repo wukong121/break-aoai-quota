@@ -28,6 +28,8 @@ This solution uses Azure's native API Management service to create a gateway tha
 Located in the [LiteLLM/](./LiteLLM/) directory.
 
 This solution deploys [LiteLLM](https://github.com/BerriAI/litellm), an open-source OpenAI proxy, onto an Azure Kubernetes Service (AKS) cluster.
+
+The deployment uses AZURE_SUBSCRIPTION_ID for the AKS subscription. After deployment, configure per-user budgets, teams, and model allowlists using [LiteLLM/USER_BUDGET_AND_MODEL_ACCESS_ZH.md](./LiteLLM/USER_BUDGET_AND_MODEL_ACCESS_ZH.md).
 - **Key File**: `deploy_mi_aks_litellm.py` - Automated deployment script.
 - **Resources Created**: AKS Cluster, PostgreSQL, Load Balancer.
 
@@ -50,13 +52,13 @@ The APIM deployment script uses the **Standard v2** SKU.
 ### Option 2: LiteLLM on AKS
 
 The LiteLLM solution deploys a lightweight AKS cluster. The parameters are defined in `LiteLLM/deploy_mi_aks_litellm.py`.
-*   **VM Size**: `Standard_B2als_v2` (ARM64, 2 vCPU, 4GB RAM)
+*   **VM Size**: `Standard_B2s` (2 vCPU, 4GB RAM)
 *   **Node Count**: 1
 
 | Resource | Spec / SKU | Unit Price (Est.) | Monthly Cost |
 | :--- | :--- | :--- | :--- |
 | **AKS Cluster Management** | Standard Tier (SLA) | ~$0.10 / hour | ~$73.00 |
-| **Virtual Machine** | Standard_B2als_v2 | ~$0.023 / hour | ~$17.00 |
+| **Virtual Machine** | Standard_B2s | ~$0.023 / hour | ~$17.00 |
 | **Managed Disk** | Standard SSD (128GB) | ~$0.06 / GB | ~$8.00 |
 | **Load Balancer** | Standard Load Balancer | ~$0.025 / hour | ~$18.00 |
 | **Public IP** | Standard Public IP | ~$0.005 / hour | ~$3.65 |
@@ -82,4 +84,4 @@ pip install -r requirements.txt
 - Navigate to `APIM/` or `LiteLLM/` and follow their respective `README.md` to run the deployment scripts.
 
 **3. Run Unified Tests:**
-- Once endpoints are provisioned, use `tests/test_all_deployments_all.py` to validate API configurations (Dual format logic).
+- Once endpoints are provisioned, use `tests/test_all_deployments.py` to validate API configurations (Dual format logic).

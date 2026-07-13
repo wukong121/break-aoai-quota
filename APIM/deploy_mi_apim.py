@@ -7,7 +7,11 @@ import uuid
 from urllib.parse import urlparse
 from azure.identity import DefaultAzureCredential, InteractiveBrowserCredential
 from azure.core.exceptions import ResourceNotFoundError
-from azure.mgmt.resource import ResourceManagementClient
+try:
+    from azure.mgmt.resource import ResourceManagementClient
+except ImportError:
+    # azure-mgmt-resource 26.x moved the sync client under .resources.
+    from azure.mgmt.resource.resources import ResourceManagementClient
 from azure.mgmt.msi import ManagedServiceIdentityClient
 from azure.mgmt.authorization import AuthorizationManagementClient
 from azure.mgmt.apimanagement import ApiManagementClient
@@ -732,6 +736,34 @@ class AzureDeploymentManager:
                     return requestBody.ToString();
                 }}</set-body>
                 <rewrite-uri template='@(context.Request.OriginalUrl.Path)' />
+            </when>
+
+            <when condition='@(context.Request.Method == "POST" &amp;&amp; context.Request.OriginalUrl.Path.EndsWith("/v1/responses"))'>
+                <set-variable name="requestModel" value='@{{
+                    var requestBody = context.Request.Body.As&lt;JObject&gt;(preserveContent: true);
+                    return requestBody?["model"]?.ToString() ?? string.Empty;
+                }}' />
+                <choose>
+                    <when condition='@(string.IsNullOrEmpty((string)context.Variables["requestModel"]))'>
+                        <return-response>
+                            <set-status code="400" reason="Bad Request" />
+                            <set-header name="Content-Type" exists-action="override">
+                                <value>application/json</value>
+                            </set-header>
+                            <set-body>{{"error": {{"message": "Request body must include a non-empty model field."}}}}</set-body>
+                        </return-response>
+                    </when>
+                </choose>
+                {model_resolution_policy}
+                <set-body>@{{
+                    var requestBody = context.Request.Body.As&lt;JObject&gt;(preserveContent: true);
+                    requestBody["model"] = (string)context.Variables["deploymentName"];
+                    return requestBody.ToString();
+                }}</set-body>
+                <rewrite-uri template='@("/responses")' />
+                <set-query-parameter name="api-version" exists-action="override">
+                    <value>{AZURE_RESPONSES_PREVIEW_API_VERSION}</value>
+                </set-query-parameter>
             </when>
 
             <when condition='@(context.Request.OriginalUrl.Path.Contains("/responses/") || (context.Request.Method == "GET" &amp;&amp; context.Request.OriginalUrl.Path.EndsWith("/models")))'>

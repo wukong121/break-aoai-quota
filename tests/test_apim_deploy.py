@@ -127,7 +127,7 @@ class DeployMiApimTests(unittest.TestCase):
         self.assertIn('/v1/responses', openai_policy)
 
         self.assertIn(AZURE_RESPONSES_PREVIEW_API_VERSION, azure_policy)
-        self.assertIn('/responses/{responseId}', azure_policy)
+        self.assertIn('context.Request.OriginalUrl.Path.Contains("/responses/")', azure_policy)
         self.assertIn('/v1/responses', azure_policy)
 
 

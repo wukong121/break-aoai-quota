@@ -42,13 +42,13 @@
 ### 方案 2: LiteLLM on AKS
 
 LiteLLM 方案部署了一个轻量级 AKS 集群。参数均在 `LiteLLM/deploy_mi_aks_litellm.py` 定义。
-*   **VM 规格**: `Standard_B2als_v2` (ARM64, 2 vCPU, 4GB RAM)
+*   **VM 规格**: `Standard_B2s` (2 vCPU, 4GB RAM)
 *   **节点数**: 1
 
 | 资源项 | 规格 / SKU | 单价 (估算) | 月费用 |
 | :--- | :--- | :--- | :--- |
 | **AKS 集群管理** | 标准层 (SLA) | ~$0.10 / 小时 | ~$73.00 |
-| **虚拟机** | Standard_B2als_v2 | ~$0.023 / 小时 | ~$17.00 |
+| **虚拟机** | Standard_B2s | ~$0.023 / 小时 | ~$17.00 |
 | **托管磁盘** | Standard SSD (128GB) | ~$0.06 / GB | ~$8.00 |
 | **负载均衡器** | Standard Load Balancer | ~$0.025 / 小时 | ~$18.00 |
 | **公网 IP** | Standard Public IP | ~$0.005 / 小时 | ~$3.65 |
@@ -74,4 +74,7 @@ pip install -r requirements.txt
 - 分别进入 `APIM/` 或 `LiteLLM/` 目录执行自动化搭建。
 
 **3. 执行全局验证测试:**
-- 当部署完成后，使用 `tests/test_all_deployments_all.py` 执行验证脚本。
+- 当部署完成后，使用 `tests/test_all_deployments.py` 执行验证脚本。
+## LiteLLM 部署补充
+
+LiteLLM 部署前请先执行 `az login`，并通过环境变量 `AZURE_SUBSCRIPTION_ID` 指定创建 AKS、Managed Identity 和资源组所使用的订阅。LiteLLM 的用户预算、Team、Virtual Key 和模型权限配置见 [`LiteLLM/USER_BUDGET_AND_MODEL_ACCESS_ZH.md`](./LiteLLM/USER_BUDGET_AND_MODEL_ACCESS_ZH.md)。

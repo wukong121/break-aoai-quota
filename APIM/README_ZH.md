@@ -25,5 +25,5 @@ pip install -r ../requirements.txt
 python deploy_mi_apim.py
 
 # 4. 测试部署
-python ../tests/test_all_deployments_all.py --config azure-openai.json --base-url "https://<your-apim>.azure-api.net" --api-key "<subscription-key>"
+python ../tests/test_all_deployments.py --config azure-openai.json --base-url "https://<your-apim>.azure-api.net" --api-key "<subscription-key>"
 ```
