@@ -7,6 +7,7 @@
 - `deploy_mi_aks_litellm.py`: AKS、Managed Identity、PostgreSQL 和 LiteLLM Proxy 部署脚本。
 - `azure-openai.json`: Azure OpenAI 资源和 deployment 配置。
 - `USER_BUDGET_AND_MODEL_ACCESS_ZH.md`: 用户、Team、Virtual Key、预算和模型权限配置指南。
+- FOUNDRY_MODEL_SYNC_ZH.md: Foundry 新增模型 deployment 后同步到 LiteLLM 的操作指南。
 - `litellm.config.yaml`: 部署脚本根据 JSON 自动生成的 LiteLLM 配置，不建议手工修改。
 
 *注：测试与依赖项已整合至项目根目录 (`../tests/` 与 `../requirements.txt`)。*

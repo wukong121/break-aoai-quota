@@ -7,6 +7,7 @@ Deploy [LiteLLM](https://github.com/BerriAI/litellm) on AKS to load-balance Azur
 - `deploy_mi_aks_litellm.py`: Deploys AKS, Managed Identity, PostgreSQL, and the LiteLLM Proxy.
 - `azure-openai.json`: Azure OpenAI resources and deployment mappings.
 - `USER_BUDGET_AND_MODEL_ACCESS_ZH.md`: Chinese guide for users, teams, virtual keys, budgets, and model access.
+- FOUNDRY_MODEL_SYNC_ZH.md: Guide for syncing new Foundry/Azure OpenAI deployments into LiteLLM.
 - `litellm.config.yaml`: Generated LiteLLM configuration; do not edit it manually because the deployment script regenerates it.
 
 *Tests and dependencies are located at the project root (`../tests/` and `../requirements.txt`).*

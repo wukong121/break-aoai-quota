@@ -13,6 +13,7 @@ Requirements:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -557,7 +558,7 @@ def build_postgres_service() -> k8s_client.V1Service:
     )
 
 
-def build_litellm_deployment(image: str) -> k8s_client.V1Deployment:
+def build_litellm_deployment(image: str, config_hash: str) -> k8s_client.V1Deployment:
     """Build LiteLLM proxy deployment."""
     return k8s_client.V1Deployment(
         metadata=k8s_client.V1ObjectMeta(name="litellm-mi-proxy"),
@@ -565,7 +566,10 @@ def build_litellm_deployment(image: str) -> k8s_client.V1Deployment:
             replicas=1,
             selector=k8s_client.V1LabelSelector(match_labels={"app": "litellm-mi-proxy"}),
             template=k8s_client.V1PodTemplateSpec(
-                metadata=k8s_client.V1ObjectMeta(labels={"app": "litellm-mi-proxy"}),
+                metadata=k8s_client.V1ObjectMeta(
+                    labels={"app": "litellm-mi-proxy"},
+                    annotations={"litellm.config-hash": config_hash},
+                ),
                 spec=k8s_client.V1PodSpec(
                     containers=[
                         k8s_client.V1Container(
@@ -801,7 +805,8 @@ def main():
     })
 
     # LiteLLM
-    k8s_mgr.apply_deployment(build_litellm_deployment(settings["litellm_image"]))
+    config_hash = hashlib.sha256(litellm_config_yaml.encode("utf-8")).hexdigest()
+    k8s_mgr.apply_deployment(build_litellm_deployment(settings["litellm_image"], config_hash))
     k8s_mgr.apply_service(build_litellm_service())
 
     if not k8s_mgr.wait_for_deployment("litellm-mi-proxy", timeout=600):

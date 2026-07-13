@@ -2,7 +2,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from LiteLLM.deploy_mi_aks_litellm import get_subscription_id
+from LiteLLM.deploy_mi_aks_litellm import build_litellm_deployment, get_subscription_id
 
 
 class SubscriptionSelectionTests(unittest.TestCase):
@@ -24,6 +24,16 @@ class SubscriptionSelectionTests(unittest.TestCase):
                 text=True,
             )
 
+    def test_litellm_deployment_rolls_when_config_hash_changes(self):
+        first = build_litellm_deployment("litellm:test", "hash-a")
+        second = build_litellm_deployment("litellm:test", "hash-b")
+
+        self.assertEqual(first.spec.template.metadata.annotations["litellm.config-hash"], "hash-a")
+        self.assertEqual(second.spec.template.metadata.annotations["litellm.config-hash"], "hash-b")
+        self.assertNotEqual(
+            first.spec.template.metadata.annotations["litellm.config-hash"],
+            second.spec.template.metadata.annotations["litellm.config-hash"],
+        )
     def test_raises_when_no_subscription_can_be_resolved(self):
         with patch.dict(os.environ, {}, clear=True), \
              patch(
