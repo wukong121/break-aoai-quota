@@ -211,3 +211,6 @@ __marimo__/
 
 # Generated LiteLLM deployment config
 LiteLLM/litellm.config.yaml
+
+# Local Git worktrees
+.worktrees/
