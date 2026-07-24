@@ -59,7 +59,7 @@ DEFAULT_CONFIG = {
     "mi_name": os.environ.get("MI_NAME", "litellm-managed-identity"),
     "aks_name": os.environ.get("AKS_NAME", "litellm-mi-aks"),
     "aks_node_count": int(os.environ.get("AKS_NODE_COUNT", "1")),
-    "aks_vm_size": os.environ.get("AKS_VM_SIZE", "Standard_B2s"),
+    "aks_vm_size": os.environ.get("AKS_VM_SIZE", "Standard_D2s_v3"),
     "aks_namespace": os.environ.get("AKS_NAMESPACE", "litellm"),
     "litellm_image": os.environ.get("LITELLM_IMAGE", "micl/litellm:mi-fix-image-gen"),
     "litellm_master_key": os.environ.get("LITELLM_MASTER_KEY", "sk-local-mi-test-key"),
