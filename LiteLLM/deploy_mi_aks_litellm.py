@@ -71,6 +71,8 @@ DEFAULT_CONFIG = {
     "pg_password": os.environ.get("PG_PASSWORD", "litellm-local-dev"),
     "pg_db": os.environ.get("PG_DB", "litellm"),
     "pg_storage": os.environ.get("PG_STORAGE", "1Gi"),
+    "litellm_hostname": os.environ.get("LITELLM_HOSTNAME", "").strip(),
+    "letsencrypt_email": os.environ.get("LETSENCRYPT_EMAIL", "").strip(),
 }
 
 OPENAI_USER_ROLE_ID = "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd"  # Cognitive Services OpenAI User
@@ -110,9 +112,10 @@ def get_subscription_id() -> str:
     if subscription_id:
         return subscription_id
 
+    az_command = _resolve_tool("az") or "az"
     try:
         subscription_id = subprocess.check_output(
-            ["az", "account", "show", "--query", "id", "-o", "tsv"],
+            [az_command, "account", "show", "--query", "id", "-o", "tsv"],
             text=True,
         ).strip()
     except (OSError, subprocess.CalledProcessError) as exc:
@@ -128,6 +131,89 @@ def get_subscription_id() -> str:
         "Cannot determine Azure subscription. "
         "Set AZURE_SUBSCRIPTION_ID or run az login."
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI Helpers (Helm-based add-ons)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _resolve_tool(name: str) -> Optional[str]:
+    """Locate a CLI tool across common Windows/Unix executable names."""
+    return (
+        shutil.which(name)
+        or shutil.which(f"{name}.cmd")
+        or shutil.which(f"{name}.exe")
+    )
+
+
+def run_cli(args: list[str], description: str) -> str:
+    """Run a CLI command, raising with captured output on failure."""
+    log(description)
+    result = subprocess.run(args, capture_output=True, text=True)
+    if result.returncode != 0:
+        if result.stdout:
+            log(result.stdout.strip(), "ERROR")
+        if result.stderr:
+            log(result.stderr.strip(), "ERROR")
+        raise RuntimeError(f"Command failed: {' '.join(args)}")
+    return result.stdout
+
+
+def _helm() -> str:
+    """Return the Helm executable path or raise with an install hint."""
+    helm = _resolve_tool("helm")
+    if not helm:
+        raise RuntimeError(
+            "helm not found. Install Helm first: https://helm.sh/docs/intro/install/"
+        )
+    return helm
+
+
+def install_ingress_nginx() -> None:
+    """Install or upgrade the ingress-nginx controller via Helm."""
+    helm = _helm()
+    run_cli(
+        [helm, "repo", "add", "ingress-nginx",
+         "https://kubernetes.github.io/ingress-nginx", "--force-update"],
+        "Adding ingress-nginx Helm repo",
+    )
+    run_cli([helm, "repo", "update"], "Updating Helm repos")
+    # The AKS cloud provider derives the Azure Load Balancer health probe from the
+    # Service ports' appProtocol (http/https). By default it probes path "/", but
+    # ingress-nginx returns HTTP 404 on "/", which Azure treats as unhealthy and
+    # removes the backend -> external 80/443 time out. Point the probe at "/healthz"
+    # (ingress-nginx answers 200) so the LB keeps the node in rotation.
+    probe_path_annotation = (
+        "controller.service.annotations."
+        "service\\.beta\\.kubernetes\\.io/azure-load-balancer-health-probe-request-path"
+        "=/healthz"
+    )
+    run_cli(
+        [helm, "upgrade", "--install", "ingress-nginx", "ingress-nginx/ingress-nginx",
+         "--namespace", "ingress-nginx", "--create-namespace",
+         "--set", "controller.service.type=LoadBalancer",
+         "--set", probe_path_annotation,
+         "--wait", "--timeout", "10m"],
+        "Installing/upgrading ingress-nginx (may take a few minutes)",
+    )
+
+
+def install_cert_manager() -> None:
+    """Install or upgrade cert-manager via Helm."""
+    helm = _helm()
+    run_cli(
+        [helm, "repo", "add", "jetstack", "https://charts.jetstack.io", "--force-update"],
+        "Adding jetstack Helm repo",
+    )
+    run_cli([helm, "repo", "update"], "Updating Helm repos")
+    run_cli(
+        [helm, "upgrade", "--install", "cert-manager", "jetstack/cert-manager",
+         "--namespace", "cert-manager", "--create-namespace",
+         "--set", "crds.enabled=true",
+         "--wait", "--timeout", "10m"],
+        "Installing/upgrading cert-manager (may take a few minutes)",
+    )
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Azure Resource Management
@@ -318,6 +404,8 @@ class KubernetesManager:
         k8s_config.load_kube_config()
         self.core_v1 = k8s_client.CoreV1Api()
         self.apps_v1 = k8s_client.AppsV1Api()
+        self.networking_v1 = k8s_client.NetworkingV1Api()
+        self.custom = k8s_client.CustomObjectsApi()
 
     def ensure_namespace(self) -> None:
         """Create namespace if it doesn't exist."""
@@ -433,18 +521,55 @@ class KubernetesManager:
             pass
         return ""
 
-    def get_service_external_ip(self, name: str, timeout: int = 150) -> Optional[str]:
-        """Get the external IP of a LoadBalancer service."""
+    def get_service_external_ip(
+        self, name: str, timeout: int = 150, namespace: Optional[str] = None
+    ) -> Optional[str]:
+        """Get the external IP (or hostname) of a LoadBalancer service."""
+        target_ns = namespace or self.namespace
         start = time.time()
         while time.time() - start < timeout:
             try:
-                svc = self.core_v1.read_namespaced_service(name, self.namespace)
+                svc = self.core_v1.read_namespaced_service(name, target_ns)
                 if svc.status.load_balancer.ingress:
-                    return svc.status.load_balancer.ingress[0].ip
+                    lb = svc.status.load_balancer.ingress[0]
+                    return lb.ip or lb.hostname
             except ApiException:
                 pass
             time.sleep(5)
         return None
+
+    def apply_ingress(self, ingress: k8s_client.V1Ingress) -> None:
+        """Create or update an Ingress."""
+        name = ingress.metadata.name
+        try:
+            self.networking_v1.read_namespaced_ingress(name, self.namespace)
+            self.networking_v1.replace_namespaced_ingress(name, self.namespace, ingress)
+        except ApiException as e:
+            if e.status == 404:
+                self.networking_v1.create_namespaced_ingress(self.namespace, ingress)
+            else:
+                raise
+
+    def apply_cluster_issuer(self, name: str, email: str) -> None:
+        """Create or update a cert-manager ClusterIssuer, waiting for the webhook."""
+        body = build_cluster_issuer(name, email)
+        last_error: Optional[Exception] = None
+        for _ in range(24):
+            try:
+                self.custom.create_cluster_custom_object(
+                    "cert-manager.io", "v1", "clusterissuers", body
+                )
+                return
+            except ApiException as e:
+                if e.status == 409:
+                    self.custom.patch_cluster_custom_object(
+                        "cert-manager.io", "v1", "clusterissuers", name, body
+                    )
+                    return
+                # cert-manager webhook may not be ready immediately after install
+                last_error = e
+                time.sleep(5)
+        raise RuntimeError(f"Failed to create ClusterIssuer: {last_error}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -603,16 +728,74 @@ def build_litellm_deployment(image: str, config_hash: str) -> k8s_client.V1Deplo
     )
 
 
-def build_litellm_service() -> k8s_client.V1Service:
+def build_litellm_service(service_type: str = "LoadBalancer") -> k8s_client.V1Service:
     """Build LiteLLM proxy service."""
     return k8s_client.V1Service(
         metadata=k8s_client.V1ObjectMeta(name="litellm-mi-proxy"),
         spec=k8s_client.V1ServiceSpec(
             selector={"app": "litellm-mi-proxy"},
             ports=[k8s_client.V1ServicePort(port=4000, target_port=4000, protocol="TCP")],
-            type="LoadBalancer",
+            type=service_type,
         ),
     )
+
+
+def build_litellm_ingress(hostname: str, namespace: str) -> k8s_client.V1Ingress:
+    """Build a TLS Ingress that routes hostname traffic to litellm-mi-proxy:4000."""
+    return k8s_client.V1Ingress(
+        metadata=k8s_client.V1ObjectMeta(
+            name="litellm-ingress",
+            namespace=namespace,
+            annotations={
+                "cert-manager.io/cluster-issuer": "letsencrypt-prod",
+                "nginx.ingress.kubernetes.io/ssl-redirect": "true",
+                "nginx.ingress.kubernetes.io/proxy-read-timeout": "300",
+                "nginx.ingress.kubernetes.io/proxy-send-timeout": "300",
+            },
+        ),
+        spec=k8s_client.V1IngressSpec(
+            ingress_class_name="nginx",
+            tls=[k8s_client.V1IngressTLS(hosts=[hostname], secret_name="litellm-tls")],
+            rules=[
+                k8s_client.V1IngressRule(
+                    host=hostname,
+                    http=k8s_client.V1HTTPIngressRuleValue(
+                        paths=[
+                            k8s_client.V1HTTPIngressPath(
+                                path="/",
+                                path_type="Prefix",
+                                backend=k8s_client.V1IngressBackend(
+                                    service=k8s_client.V1IngressServiceBackend(
+                                        name="litellm-mi-proxy",
+                                        port=k8s_client.V1ServiceBackendPort(number=4000),
+                                    )
+                                ),
+                            )
+                        ]
+                    ),
+                )
+            ],
+        ),
+    )
+
+
+def build_cluster_issuer(name: str, email: str) -> dict[str, Any]:
+    """Build a Let's Encrypt (production) ClusterIssuer manifest."""
+    return {
+        "apiVersion": "cert-manager.io/v1",
+        "kind": "ClusterIssuer",
+        "metadata": {"name": name},
+        "spec": {
+            "acme": {
+                "server": "https://acme-v02.api.letsencrypt.org/directory",
+                "email": email,
+                "privateKeySecretRef": {"name": name},
+                "solvers": [
+                    {"http01": {"ingress": {"class": "nginx"}}}
+                ],
+            }
+        },
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -703,6 +886,17 @@ def main():
 
     log(f"Configuration loaded from: {args.config}")
     log(f"Region: {region}, Resource Group: {rg_name}, MI: {mi_name}")
+
+    # Determine exposure mode: Ingress+HTTPS when a hostname is provided
+    ingress_enabled = bool(settings["litellm_hostname"])
+    if ingress_enabled and not settings["letsencrypt_email"]:
+        log("LITELLM_HOSTNAME is set but LETSENCRYPT_EMAIL is empty.", "ERROR")
+        log("Set LETSENCRYPT_EMAIL so cert-manager can issue a Let's Encrypt certificate.", "ERROR")
+        sys.exit(1)
+    if ingress_enabled:
+        log(f"Ingress mode enabled: https://{settings['litellm_hostname']} (Let's Encrypt)")
+    else:
+        log("Ingress mode disabled: exposing LiteLLM via LoadBalancer:4000")
 
     # Get current subscription
     subscription_id = get_subscription_id()
@@ -807,7 +1001,8 @@ def main():
     # LiteLLM
     config_hash = hashlib.sha256(litellm_config_yaml.encode("utf-8")).hexdigest()
     k8s_mgr.apply_deployment(build_litellm_deployment(settings["litellm_image"], config_hash))
-    k8s_mgr.apply_service(build_litellm_service())
+    service_type = "ClusterIP" if ingress_enabled else "LoadBalancer"
+    k8s_mgr.apply_service(build_litellm_service(service_type))
 
     if not k8s_mgr.wait_for_deployment("litellm-mi-proxy", timeout=600):
         log("LiteLLM deployment failed to become ready", "ERROR")
@@ -821,21 +1016,37 @@ def main():
             break
         time.sleep(5)
 
-    # Step 9: Get external IP
-    external_ip = k8s_mgr.get_service_external_ip("litellm-mi-proxy")
-    base_url = f"http://{external_ip}:4000" if external_ip else "(pending)"
+    # Step 9: Expose the service (Ingress+HTTPS or LoadBalancer)
+    ingress_ip: Optional[str] = None
+    if ingress_enabled:
+        log("Setting up ingress-nginx + cert-manager for HTTPS")
+        install_ingress_nginx()
+        install_cert_manager()
+        k8s_mgr.apply_cluster_issuer("letsencrypt-prod", settings["letsencrypt_email"])
+        k8s_mgr.apply_ingress(
+            build_litellm_ingress(settings["litellm_hostname"], settings["aks_namespace"])
+        )
+        ingress_ip = k8s_mgr.get_service_external_ip(
+            "ingress-nginx-controller", timeout=300, namespace="ingress-nginx"
+        )
+        base_url = f"https://{settings['litellm_hostname']}"
+        log("Skipping public smoke test: point DNS to the ingress IP first, "
+            "then the certificate is issued automatically.")
+    else:
+        external_ip = k8s_mgr.get_service_external_ip("litellm-mi-proxy")
+        base_url = f"http://{external_ip}:4000" if external_ip else "(pending)"
 
-    # Step 10: Smoke test
-    if settings["run_smoke_test"] and external_ip:
-        first_deployment = cfg["deployment_list"][0]["deployment_name"]
-        model_alias = first_deployment
+        # Step 10: Smoke test (LoadBalancer mode only)
+        if settings["run_smoke_test"] and external_ip:
+            first_deployment = cfg["deployment_list"][0]["deployment_name"]
+            model_alias = first_deployment
 
-        # Wait a bit for service to be reachable
-        time.sleep(10)
+            # Wait a bit for service to be reachable
+            time.sleep(10)
 
-        if not run_smoke_test(base_url, settings["litellm_master_key"], model_alias, settings["azure_api_version"]):
-            log("Smoke test failed", "ERROR")
-            sys.exit(1)
+            if not run_smoke_test(base_url, settings["litellm_master_key"], model_alias, settings["azure_api_version"]):
+                log("Smoke test failed", "ERROR")
+                sys.exit(1)
 
     # Step 11: Print summary
     print()
@@ -854,6 +1065,19 @@ def main():
     print(f"  AKS Cluster       : {settings['aks_name']} ({settings['aks_vm_size']} x{settings['aks_node_count']})")
     print(f"  Namespace         : {settings['aks_namespace']}")
     print(f"  Database          : PostgreSQL (in-cluster)")
+    if ingress_enabled:
+        print()
+        print("-" * 63)
+        print("  Next step: point Alibaba Cloud DNS at the ingress")
+        print("-" * 63)
+        print(f"  Hostname          : {settings['litellm_hostname']}")
+        print(f"  Ingress public IP : {ingress_ip or '(pending, re-check with kubectl)'}")
+        print()
+        print("  Create an A record in Alibaba Cloud DNS:")
+        print(f"    A  {settings['litellm_hostname']}  ->  {ingress_ip or '<ingress IP>'}")
+        print()
+        print("  The certificate is issued automatically after DNS propagates. Check:")
+        print(f"    kubectl get certificate -n {settings['aks_namespace']}")
     print()
     print("=" * 63)
 

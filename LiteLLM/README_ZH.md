@@ -82,3 +82,19 @@ python ..\tests\test_all_deployments.py `
 - 不要把管理员 Master Key 分发给普通用户；应为每个用户创建 Virtual Key。
 - 当前部署使用公网 LoadBalancer，生产环境应增加 TLS、网络访问限制和强随机 Key。
 - PostgreSQL 当前是 AKS 内单副本部署，适合验证和轻量场景；生产环境建议使用高可用数据库和备份。
+
+## 🌐 绑定自有域名并启用 HTTPS
+
+想通过 `https://litellm.你的域名.com` 访问（而不是 `http://<IP>:4000`），可设置 `LITELLM_HOSTNAME` 让脚本自动配置 ingress-nginx + cert-manager（Let's Encrypt 证书）：
+
+```powershell
+$env:LITELLM_HOSTNAME = "litellm.example.com"   # 触发 Ingress 模式
+$env:LETSENCRYPT_EMAIL = "you@example.com"       # Let's Encrypt 证书邮箱（必填）
+python .\deploy_mi_aks_litellm.py
+```
+
+- 前置条件：本机已安装 Helm 和 kubectl。
+- 脚本结束会打印 ingress 公网 IP，你到阿里云 DNS 加一条 A 记录指向它，DNS 生效后证书自动签发。
+- 不设 `LITELLM_HOSTNAME` 时保持原有 `LoadBalancer:4000` 行为。
+
+完整步骤（买域名、DNS、证书、验证、排查、回滚）见 [`CUSTOM_DOMAIN_SETUP_ZH.md`](./CUSTOM_DOMAIN_SETUP_ZH.md)。

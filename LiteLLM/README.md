@@ -75,3 +75,19 @@ The test validates both OpenAI-style and Azure OpenAI-style Chat routes. On Wind
 - Do not distribute the Admin Master Key; create a Virtual Key for each user.
 - The default service uses a public LoadBalancer. Production deployments should add TLS, network restrictions, and a strong random key.
 - PostgreSQL is currently a single in-cluster replica for lightweight deployments; production environments should use a highly available database with backups.
+
+## Custom domain and HTTPS
+
+To serve LiteLLM at `https://litellm.your-domain.com` instead of `http://<IP>:4000`, set `LITELLM_HOSTNAME` and the script will automatically configure ingress-nginx + cert-manager (Let's Encrypt):
+
+```powershell
+$env:LITELLM_HOSTNAME = "litellm.example.com"   # enables ingress mode
+$env:LETSENCRYPT_EMAIL = "you@example.com"       # required for Let's Encrypt
+python .\deploy_mi_aks_litellm.py
+```
+
+- Prerequisites: Helm and kubectl installed locally.
+- The script prints the ingress public IP; create an A record for it in your DNS provider. The certificate is issued automatically after DNS propagates.
+- Without `LITELLM_HOSTNAME`, the script keeps the existing `LoadBalancer:4000` behavior.
+
+See [`CUSTOM_DOMAIN_SETUP_ZH.md`](./CUSTOM_DOMAIN_SETUP_ZH.md) for the full runbook (buy domain, DNS, certificate, verification, troubleshooting, rollback).

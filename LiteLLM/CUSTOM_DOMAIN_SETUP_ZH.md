@@ -18,6 +18,7 @@
 - [方案选择](#方案选择)
 - [方案 A（最快）：直接把域名指向 LoadBalancer（仅 HTTP）](#方案-a最快直接把域名指向-loadbalancer仅-http)
 - [方案 B（推荐）：Ingress + HTTPS 证书](#方案-b推荐ingress--https-证书)
+  - [B-零. 用部署脚本一键启用（推荐）](#b-零-用部署脚本一键启用推荐)
   - [B1. 安装 ingress-nginx](#b1-安装-ingress-nginx)
   - [B2. 拿到 Ingress 公网 IP 并在阿里云配置 DNS](#b2-拿到-ingress-公网-ip-并在阿里云配置-dns)
   - [B3-甲. 用 Let's Encrypt 自动签发证书（推荐、免费、自动续期）](#b3-甲用-lets-encrypt-自动签发证书推荐免费自动续期)
@@ -113,6 +114,62 @@ litellm-mi-proxy    LoadBalancer   10.0.x.x       20.x.x.x         4000:xxxxx/TC
 客户端 --HTTPS:443--> 阿里云DNS(A记录) --> ingress-nginx 公网IP
         --TLS终止/证书--> Ingress 规则 --> litellm-mi-proxy:4000 --> LiteLLM Pod
 ```
+
+方案 B 有两条实现路径，任选其一：
+
+- **B-零（推荐，一键）**：直接用部署脚本自动完成，见下方「用部署脚本一键启用」。
+- **B1~B5（手动）**：自己一步步执行 Helm 和 kubectl 命令，适合想理解每步细节、或不想让脚本装 Helm 组件的场景。
+
+---
+
+### B-零. 用部署脚本一键启用（推荐）
+
+部署脚本 `deploy_mi_aks_litellm.py` 已内置 Ingress 模式。当你设置了 `LITELLM_HOSTNAME` 环境变量时，脚本会自动：
+
+1. 把 LiteLLM 的 Service 从 `LoadBalancer` 收敛为 `ClusterIP`；
+2. 用 Helm 安装 / 升级 **ingress-nginx** 和 **cert-manager**；
+3. 创建 Let's Encrypt 的 `ClusterIssuer` 和指向 `litellm-mi-proxy:4000` 的 TLS Ingress；
+4. 读取 ingress-nginx 的公网 IP，并在结尾打印你需要在阿里云配置的 A 记录。
+
+**前置条件**：本机已安装 [Helm](https://helm.sh/docs/intro/install/)（`winget install Helm.Helm`）和 `kubectl`，且已 `az login`。
+
+```powershell
+cd .\LiteLLM
+
+# 设置域名（触发 Ingress 模式）和 Let's Encrypt 邮箱
+$env:LITELLM_HOSTNAME = "litellm.example.com"
+$env:LETSENCRYPT_EMAIL = "you@example.com"
+
+python .\deploy_mi_aks_litellm.py
+```
+
+脚本跑完会输出类似：
+
+```text
+  Next step: point Alibaba Cloud DNS at the ingress
+  Hostname          : litellm.example.com
+  Ingress public IP : 20.x.x.x
+
+  Create an A record in Alibaba Cloud DNS:
+    A  litellm.example.com  ->  20.x.x.x
+```
+
+拿到这个 IP 后，去阿里云 DNS 添加 A 记录（见 [B2](#b2-拿到-ingress-公网-ip-并在阿里云配置-dns) 的表格），DNS 生效后 cert-manager 会**自动**签发证书。用下面命令查看签发进度：
+
+```powershell
+kubectl get certificate -n litellm
+# READY 变成 True 即签发成功
+```
+
+> **注意事项**
+> - **不设 `LITELLM_HOSTNAME`** 时脚本保持原有行为：`LoadBalancer:4000` + 明文 HTTP，不安装任何 Ingress 组件。
+> - 设了 `LITELLM_HOSTNAME` 就**必须**同时设 `LETSENCRYPT_EMAIL`，否则脚本会报错退出。
+> - 首次部署时 DNS 还没配好，证书无法立即签发，因此脚本会**跳过公网 smoke test**，这是正常的。配好 DNS、证书 `READY=True` 后，再用[第 3 步](#第-3-步验证)手动验证。
+> - 脚本可反复执行（幂等）：Helm 用 `upgrade --install`，Ingress / ClusterIssuer 存在时会更新而非报错。
+
+之后就可以跳到[第 3 步：验证](#第-3-步验证)。如果你想手动完成或排查脚本行为，继续看下面的 B1~B5。
+
+---
 
 ### B1. 安装 ingress-nginx
 
