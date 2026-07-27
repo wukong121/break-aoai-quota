@@ -898,8 +898,7 @@ def run_smoke_test(
 def main():
     default_config = Path(__file__).parent / "azure-openai.loc.json"
     if not default_config.exists():
-        legacy_local = Path(__file__).parent / "azure-openai.loc"
-        default_config = legacy_local if legacy_local.exists() else Path(__file__).parent / "azure-openai.json"
+        default_config = Path(__file__).parent / "azure-openai.json"
 
     parser = argparse.ArgumentParser(description="Deploy LiteLLM with Managed Identity to AKS")
     parser.add_argument(

@@ -48,8 +48,7 @@ class AzureDeploymentManager:
         if config_file is None:
             local_config = Path(__file__).parent / "azure-openai.loc.json"
             if not local_config.exists():
-                legacy_local = Path(__file__).parent / "azure-openai.loc"
-                local_config = legacy_local if legacy_local.exists() else Path(__file__).parent / "azure-openai.json"
+                local_config = Path(__file__).parent / "azure-openai.json"
             config_file = str(local_config)
         self.config = self._load_config(config_file)
         self.model_alias_map = self.build_model_alias_map(self.config['deployment_list'])

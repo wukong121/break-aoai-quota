@@ -216,7 +216,5 @@ LiteLLM/litellm.config.yaml
 .worktrees/
 
 # Local-only Azure config files (do not commit)
-APIM/azure-openai.loc
-LiteLLM/azure-openai.loc
 APIM/azure-openai.loc.json
 LiteLLM/azure-openai.loc.json
