@@ -129,7 +129,8 @@ litellm-mi-proxy    LoadBalancer   10.0.x.x       20.x.x.x         4000:xxxxx/TC
 1. 把 LiteLLM 的 Service 从 `LoadBalancer` 收敛为 `ClusterIP`；
 2. 用 Helm 安装 / 升级 **ingress-nginx** 和 **cert-manager**；
 3. 创建 Let's Encrypt 的 `ClusterIssuer` 和指向 `litellm-mi-proxy:4000` 的 TLS Ingress；
-4. 读取 ingress-nginx 的公网 IP，并在结尾打印你需要在阿里云配置的 A 记录。
+4. 为 Ingress 自动设置大请求和流式响应相关注解（`proxy-buffering=off`、`proxy-read-timeout=600`、`proxy-send-timeout=600`、`proxy-body-size=100m`）；
+5. 读取 ingress-nginx 的公网 IP，并在结尾打印你需要在阿里云配置的 A 记录。
 
 **前置条件**：本机已安装 [Helm](https://helm.sh/docs/intro/install/)（`winget install Helm.Helm`）和 `kubectl`，且已 `az login`。
 
@@ -139,6 +140,13 @@ cd .\LiteLLM
 # 设置域名（触发 Ingress 模式）和 Let's Encrypt 邮箱
 $env:LITELLM_HOSTNAME = "litellm.example.com"
 $env:LETSENCRYPT_EMAIL = "you@example.com"
+
+# 可选：显式指定 master key（推荐生产环境由密钥管理系统注入）
+# 不设置时脚本会自动生成强随机 key，并在结尾打印一次
+# $env:LITELLM_MASTER_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxx"
+
+# 可选：按需调整启动等待时长（秒），默认 180
+# $env:LITELLM_STARTUP_WAIT_SECONDS = "300"
 
 python .\deploy_mi_aks_litellm.py
 ```
@@ -164,7 +172,15 @@ kubectl get certificate -n litellm
 > **注意事项**
 > - **不设 `LITELLM_HOSTNAME`** 时脚本保持原有行为：`LoadBalancer:4000` + 明文 HTTP，不安装任何 Ingress 组件。
 > - 设了 `LITELLM_HOSTNAME` 就**必须**同时设 `LETSENCRYPT_EMAIL`，否则脚本会报错退出。
+> - `LITELLM_MASTER_KEY`：
+>   - 不设置时，脚本会自动生成强随机 key 并用于本次部署；
+>   - 建议生产环境显式注入（来自 Key Vault / 密钥管理系统），便于审计和轮换。
 > - 首次部署时 DNS 还没配好，证书无法立即签发，因此脚本会**跳过公网 smoke test**，这是正常的。配好 DNS、证书 `READY=True` 后，再用[第 3 步](#第-3-步验证)手动验证。
+> - 脚本默认会设置以下 Ingress 注解（可通过环境变量覆盖）：
+>   - `nginx.ingress.kubernetes.io/proxy-buffering=off`
+>   - `nginx.ingress.kubernetes.io/proxy-read-timeout=600`
+>   - `nginx.ingress.kubernetes.io/proxy-send-timeout=600`
+>   - `nginx.ingress.kubernetes.io/proxy-body-size=100m`
 > - 脚本可反复执行（幂等）：Helm 用 `upgrade --install`，Ingress / ClusterIssuer 存在时会更新而非报错。
 
 之后就可以跳到[第 3 步：验证](#第-3-步验证)。如果你想手动完成或排查脚本行为，继续看下面的 B1~B5。
@@ -278,8 +294,10 @@ metadata:
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
 spec:
   ingressClassName: nginx
   tls:
@@ -354,7 +372,7 @@ python ..\tests\test_all_deployments.py `
 | 证书一直 `READY=False` | DNS 未指向 ingress-nginx，HTTP-01 挑战失败 | 先确保 B2 解析生效，再 `kubectl describe certificate -n litellm` 看报错 |
 | 浏览器提示证书不受信任 | 证书没签发成功，走了 ingress 默认自签名证书 | 检查 `kubectl get certificate -n litellm`，或确认 `litellm-tls` Secret 存在 |
 | `502 Bad Gateway` | Ingress 后端指向错了 / LiteLLM 未就绪 | 确认 backend 是 `litellm-mi-proxy:4000`；`kubectl get pods -n litellm` 看 Pod 是否 Running |
-| 长请求（大模型输出）被截断/超时 | Nginx 默认 60s 超时 | 已在注解里设 `proxy-read-timeout: 300`，需要更长可继续调大 |
+| 长请求/流式响应异常（超时、断流、413） | Nginx 默认缓冲与请求大小限制 | 建议注解：`proxy-buffering=off`、`proxy-read-timeout=600`、`proxy-send-timeout=600`、`proxy-body-size=100m`；仍不足再继续调大 |
 | 拿不到 ingress-nginx 的 EXTERNAL-IP | LoadBalancer 还在分配 | `kubectl get svc -n ingress-nginx -w` 等待；若长期 pending 检查订阅配额 |
 
 查看入口控制器日志：

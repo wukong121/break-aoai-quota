@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -62,7 +63,13 @@ DEFAULT_CONFIG = {
     "aks_vm_size": os.environ.get("AKS_VM_SIZE", "Standard_D2s_v3"),
     "aks_namespace": os.environ.get("AKS_NAMESPACE", "litellm"),
     "litellm_image": os.environ.get("LITELLM_IMAGE", "micl/litellm:mi-fix-image-gen"),
-    "litellm_master_key": os.environ.get("LITELLM_MASTER_KEY", "sk-local-mi-test-key"),
+    "litellm_master_key": os.environ.get("LITELLM_MASTER_KEY", "").strip(),
+    "auto_generate_master_key": os.environ.get("AUTO_GENERATE_MASTER_KEY", "true").lower() == "true",
+    "litellm_startup_wait_seconds": int(os.environ.get("LITELLM_STARTUP_WAIT_SECONDS", "180")),
+    "ingress_proxy_body_size": os.environ.get("INGRESS_PROXY_BODY_SIZE", "100m").strip() or "100m",
+    "ingress_proxy_buffering": os.environ.get("INGRESS_PROXY_BUFFERING", "off").strip() or "off",
+    "ingress_proxy_read_timeout": os.environ.get("INGRESS_PROXY_READ_TIMEOUT", "600").strip() or "600",
+    "ingress_proxy_send_timeout": os.environ.get("INGRESS_PROXY_SEND_TIMEOUT", "600").strip() or "600",
     "azure_scope": os.environ.get("AZURE_SCOPE", "https://cognitiveservices.azure.com/.default"),
     "azure_api_version": os.environ.get("AZURE_API_VERSION", ""),
     "openai_role_name": os.environ.get("OPENAI_ROLE_NAME", "Cognitive Services OpenAI User"),
@@ -85,6 +92,11 @@ OPENAI_USER_ROLE_ID = "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd"  # Cognitive Servic
 def log(message: str, level: str = "INFO") -> None:
     """Print a log message with timestamp."""
     print(f"[{level}] {message}")
+
+
+def generate_master_key() -> str:
+    """Generate a strong URL-safe LiteLLM master key."""
+    return f"sk-{secrets.token_urlsafe(48)}"
 
 
 def load_config(config_path: str) -> dict[str, Any]:
@@ -512,8 +524,19 @@ class KubernetesManager:
                 label_selector=f"app={deployment_name}"
             )
             if pods.items:
+                # Prefer the newest running pod during rolling updates.
+                selected = sorted(
+                    pods.items,
+                    key=lambda p: p.metadata.creation_timestamp or 0,
+                    reverse=True,
+                )[0]
+                for pod in pods.items:
+                    phase = (pod.status.phase or "").lower()
+                    if phase == "running":
+                        selected = pod
+                        break
                 return self.core_v1.read_namespaced_pod_log(
-                    pods.items[0].metadata.name,
+                    selected.metadata.name,
                     self.namespace,
                     tail_lines=tail_lines,
                 )
@@ -740,7 +763,14 @@ def build_litellm_service(service_type: str = "LoadBalancer") -> k8s_client.V1Se
     )
 
 
-def build_litellm_ingress(hostname: str, namespace: str) -> k8s_client.V1Ingress:
+def build_litellm_ingress(
+    hostname: str,
+    namespace: str,
+    proxy_body_size: str,
+    proxy_buffering: str,
+    proxy_read_timeout: str,
+    proxy_send_timeout: str,
+) -> k8s_client.V1Ingress:
     """Build a TLS Ingress that routes hostname traffic to litellm-mi-proxy:4000."""
     return k8s_client.V1Ingress(
         metadata=k8s_client.V1ObjectMeta(
@@ -749,8 +779,10 @@ def build_litellm_ingress(hostname: str, namespace: str) -> k8s_client.V1Ingress
             annotations={
                 "cert-manager.io/cluster-issuer": "letsencrypt-prod",
                 "nginx.ingress.kubernetes.io/ssl-redirect": "true",
-                "nginx.ingress.kubernetes.io/proxy-read-timeout": "300",
-                "nginx.ingress.kubernetes.io/proxy-send-timeout": "300",
+                "nginx.ingress.kubernetes.io/proxy-body-size": proxy_body_size,
+                "nginx.ingress.kubernetes.io/proxy-buffering": proxy_buffering,
+                "nginx.ingress.kubernetes.io/proxy-read-timeout": proxy_read_timeout,
+                "nginx.ingress.kubernetes.io/proxy-send-timeout": proxy_send_timeout,
             },
         ),
         spec=k8s_client.V1IngressSpec(
@@ -893,6 +925,20 @@ def main():
         log("LITELLM_HOSTNAME is set but LETSENCRYPT_EMAIL is empty.", "ERROR")
         log("Set LETSENCRYPT_EMAIL so cert-manager can issue a Let's Encrypt certificate.", "ERROR")
         sys.exit(1)
+    generated_master_key: Optional[str] = None
+    if not settings["litellm_master_key"]:
+        if settings["auto_generate_master_key"]:
+            generated_master_key = generate_master_key()
+            settings["litellm_master_key"] = generated_master_key
+            log("LITELLM_MASTER_KEY is empty. Auto-generated a strong key for this deployment.", "WARN")
+        else:
+            log("LITELLM_MASTER_KEY is empty.", "ERROR")
+            log("Set a strong key via environment variable LITELLM_MASTER_KEY (at least 24 chars), or set AUTO_GENERATE_MASTER_KEY=true.", "ERROR")
+            sys.exit(1)
+    if len(settings["litellm_master_key"]) < 24:
+        log("LITELLM_MASTER_KEY is too short.", "ERROR")
+        log("Use a strong key with at least 24 characters for production deployments.", "ERROR")
+        sys.exit(1)
     if ingress_enabled:
         log(f"Ingress mode enabled: https://{settings['litellm_hostname']} (Let's Encrypt)")
     else:
@@ -1010,11 +1056,24 @@ def main():
 
     # Wait for app to fully start
     log("Waiting for LiteLLM application to start (Prisma migrations + Uvicorn)...")
-    for _ in range(60):
+    startup_wait_seconds = max(0, settings["litellm_startup_wait_seconds"])
+    poll_seconds = 5
+    attempts = startup_wait_seconds // poll_seconds if startup_wait_seconds > 0 else 0
+    uvicorn_ready = False
+    for i in range(attempts):
         logs = k8s_mgr.get_pod_logs("litellm-mi-proxy", tail_lines=10)
         if "Uvicorn running" in logs:
+            uvicorn_ready = True
             break
-        time.sleep(5)
+        if i % 6 == 0:
+            elapsed = i * poll_seconds
+            log(f"LiteLLM still starting... elapsed={elapsed}s/{startup_wait_seconds}s")
+        time.sleep(poll_seconds)
+    if not uvicorn_ready and startup_wait_seconds > 0:
+        log(
+            "Timed out waiting for 'Uvicorn running'. Continuing with ingress setup; service may still become ready shortly.",
+            "WARN",
+        )
 
     # Step 9: Expose the service (Ingress+HTTPS or LoadBalancer)
     ingress_ip: Optional[str] = None
@@ -1024,7 +1083,14 @@ def main():
         install_cert_manager()
         k8s_mgr.apply_cluster_issuer("letsencrypt-prod", settings["letsencrypt_email"])
         k8s_mgr.apply_ingress(
-            build_litellm_ingress(settings["litellm_hostname"], settings["aks_namespace"])
+            build_litellm_ingress(
+                settings["litellm_hostname"],
+                settings["aks_namespace"],
+                settings["ingress_proxy_body_size"],
+                settings["ingress_proxy_buffering"],
+                settings["ingress_proxy_read_timeout"],
+                settings["ingress_proxy_send_timeout"],
+            )
         )
         ingress_ip = k8s_mgr.get_service_external_ip(
             "ingress-nginx-controller", timeout=300, namespace="ingress-nginx"
@@ -1056,15 +1122,18 @@ def main():
     print()
     print(f"  Web UI URL        : {base_url}/ui")
     print(f"  Web UI Username   : admin")
-    print(f"  Web UI Password   : {settings['litellm_master_key']}")
+    print("  Web UI Password   : (hidden, from LITELLM_MASTER_KEY)")
     print()
     print(f"  API Base URL      : {base_url}")
-    print(f"  API Key           : {settings['litellm_master_key']}")
+    print("  API Key           : (hidden, from LITELLM_MASTER_KEY)")
     print()
     print(f"  Managed Identity  : {mi_name} (client_id: {mi_info['client_id']})")
     print(f"  AKS Cluster       : {settings['aks_name']} ({settings['aks_vm_size']} x{settings['aks_node_count']})")
     print(f"  Namespace         : {settings['aks_namespace']}")
     print(f"  Database          : PostgreSQL (in-cluster)")
+    if generated_master_key:
+        print(f"  Generated Master Key : {generated_master_key}")
+        print("  IMPORTANT            : Save this key securely and rotate it into your secret manager.")
     if ingress_enabled:
         print()
         print("-" * 63)
