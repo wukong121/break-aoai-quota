@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import uuid
+from pathlib import Path
 from urllib.parse import urlparse
 from azure.identity import DefaultAzureCredential, InteractiveBrowserCredential
 from azure.core.exceptions import ResourceNotFoundError
@@ -43,7 +44,10 @@ AZURE_RESPONSES_PREVIEW_API_VERSION = "2025-04-01-preview"
 ROUND_ROBIN_CACHE_KEY = "aoai-apim-round-robin-index"
 
 class AzureDeploymentManager:
-    def __init__(self, config_file="azure-openai.json"):
+    def __init__(self, config_file=None):
+        if config_file is None:
+            local_config = Path(__file__).parent / "azure-openai.loc"
+            config_file = str(local_config) if local_config.exists() else "azure-openai.json"
         self.config = self._load_config(config_file)
         self.model_alias_map = self.build_model_alias_map(self.config['deployment_list'])
         self.identity_client_id = None
