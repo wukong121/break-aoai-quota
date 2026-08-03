@@ -218,11 +218,19 @@ def install_cert_manager() -> None:
         "Adding jetstack Helm repo",
     )
     run_cli([helm, "repo", "update"], "Updating Helm repos")
+    upgrade_args = [
+        helm, "upgrade", "--install", "cert-manager", "jetstack/cert-manager",
+        "--namespace", "cert-manager", "--create-namespace",
+        "--set", "crds.enabled=true",
+    ]
+    upgrade_help = subprocess.run(
+        [helm, "upgrade", "--help"], capture_output=True, text=True
+    )
+    if "--server-side" in upgrade_help.stdout:
+        upgrade_args.append("--server-side=false")
+    upgrade_args.extend(["--wait", "--timeout", "10m"])
     run_cli(
-        [helm, "upgrade", "--install", "cert-manager", "jetstack/cert-manager",
-         "--namespace", "cert-manager", "--create-namespace",
-         "--set", "crds.enabled=true",
-         "--wait", "--timeout", "10m"],
+        upgrade_args,
         "Installing/upgrading cert-manager (may take a few minutes)",
     )
 
@@ -706,7 +714,11 @@ def build_postgres_service() -> k8s_client.V1Service:
     )
 
 
-def build_litellm_deployment(image: str, config_hash: str) -> k8s_client.V1Deployment:
+def build_litellm_deployment(
+    image: str,
+    config_hash: str,
+    secret_hash: str,
+) -> k8s_client.V1Deployment:
     """Build LiteLLM proxy deployment."""
     return k8s_client.V1Deployment(
         metadata=k8s_client.V1ObjectMeta(name="litellm-mi-proxy"),
@@ -716,7 +728,10 @@ def build_litellm_deployment(image: str, config_hash: str) -> k8s_client.V1Deplo
             template=k8s_client.V1PodTemplateSpec(
                 metadata=k8s_client.V1ObjectMeta(
                     labels={"app": "litellm-mi-proxy"},
-                    annotations={"litellm.config-hash": config_hash},
+                    annotations={
+                        "litellm.config-hash": config_hash,
+                        "litellm.secret-hash": secret_hash,
+                    },
                 ),
                 spec=k8s_client.V1PodSpec(
                     containers=[
@@ -1039,18 +1054,24 @@ def main():
     log("PostgreSQL is ready.")
 
     # Secret
-    k8s_mgr.apply_secret("litellm-env", {
+    secret_data = {
         "AZURE_CREDENTIAL": "ManagedIdentityCredential",
         "AZURE_CLIENT_ID": mi_info["client_id"],
         "AZURE_SCOPE": settings["azure_scope"],
         "AZURE_API_VERSION": settings["azure_api_version"],
         "LITELLM_MASTER_KEY": settings["litellm_master_key"],
         "DATABASE_URL": database_url,
-    })
+    }
+    k8s_mgr.apply_secret("litellm-env", secret_data)
 
     # LiteLLM
     config_hash = hashlib.sha256(litellm_config_yaml.encode("utf-8")).hexdigest()
-    k8s_mgr.apply_deployment(build_litellm_deployment(settings["litellm_image"], config_hash))
+    secret_hash = hashlib.sha256(
+        json.dumps(secret_data, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    k8s_mgr.apply_deployment(
+        build_litellm_deployment(settings["litellm_image"], config_hash, secret_hash)
+    )
     service_type = "ClusterIP" if ingress_enabled else "LoadBalancer"
     k8s_mgr.apply_service(build_litellm_service(service_type))
 
