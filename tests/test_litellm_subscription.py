@@ -1,8 +1,18 @@
 import os
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
 from unittest.mock import patch
 
-from LiteLLM.deploy_mi_aks_litellm import build_litellm_deployment, get_subscription_id
+import yaml
+
+from LiteLLM.deploy_mi_aks_litellm import (
+    AzureResourceManager,
+    build_litellm_deployment,
+    generate_litellm_config,
+    get_subscription_id,
+    parse_affinity_checks,
+)
 
 
 class SubscriptionSelectionTests(unittest.TestCase):
@@ -24,9 +34,41 @@ class SubscriptionSelectionTests(unittest.TestCase):
                 text=True,
             )
 
+    def test_generated_config_enables_responses_affinity(self):
+        config = {
+            "azure-openai-list": [
+                {
+                    "name": "aoai-a",
+                    "endpoint": "https://aoai-a.openai.azure.com/",
+                }
+            ],
+            "deployment_list": [
+                {"model": "gpt-test", "deployment_name": "gpt-test"}
+            ],
+        }
+        settings = {
+            "affinity_checks": [
+                "responses_api_deployment_check",
+                "deployment_affinity",
+                "session_affinity",
+            ],
+            "deployment_affinity_ttl_seconds": 1800,
+        }
+
+        generated = yaml.safe_load(generate_litellm_config(config, settings))
+
+        self.assertEqual(
+            generated["router_settings"]["optional_pre_call_checks"],
+            settings["affinity_checks"],
+        )
+        self.assertEqual(
+            generated["router_settings"]["deployment_affinity_ttl_seconds"],
+            1800,
+        )
+
     def test_litellm_deployment_rolls_when_config_hash_changes(self):
-        first = build_litellm_deployment("litellm:test", "hash-a")
-        second = build_litellm_deployment("litellm:test", "hash-b")
+        first = build_litellm_deployment("litellm:test", "hash-a", "secret-hash")
+        second = build_litellm_deployment("litellm:test", "hash-b", "secret-hash")
 
         self.assertEqual(first.spec.template.metadata.annotations["litellm.config-hash"], "hash-a")
         self.assertEqual(second.spec.template.metadata.annotations["litellm.config-hash"], "hash-b")
@@ -34,6 +76,35 @@ class SubscriptionSelectionTests(unittest.TestCase):
             first.spec.template.metadata.annotations["litellm.config-hash"],
             second.spec.template.metadata.annotations["litellm.config-hash"],
         )
+
+    def test_affinity_checks_reject_unknown_values(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported LITELLM_AFFINITY_CHECKS"):
+            parse_affinity_checks("responses_api_deployment_check,unknown-check")
+
+    def test_existing_vmss_identity_skips_update(self):
+        identity_id = (
+            "/subscriptions/sub/resourceGroups/rg/providers/"
+            "Microsoft.ManagedIdentity/userAssignedIdentities/litellm"
+        )
+        manager = AzureResourceManager.__new__(AzureResourceManager)
+        manager.compute_client = SimpleNamespace(
+            virtual_machine_scale_sets=SimpleNamespace(
+                get=Mock(
+                    return_value=SimpleNamespace(
+                        identity=SimpleNamespace(
+                            type="UserAssigned",
+                            user_assigned_identities={identity_id.lower(): {}},
+                        )
+                    )
+                ),
+                begin_update=Mock(),
+            )
+        )
+
+        manager.assign_identity_to_vmss("vmss", "node-rg", identity_id)
+
+        manager.compute_client.virtual_machine_scale_sets.begin_update.assert_not_called()
+
     def test_raises_when_no_subscription_can_be_resolved(self):
         with patch.dict(os.environ, {}, clear=True), \
              patch(

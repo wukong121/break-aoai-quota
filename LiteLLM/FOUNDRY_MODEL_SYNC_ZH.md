@@ -213,9 +213,42 @@ az cognitiveservices account deployment list `
 
 当前仓库默认采用第一种简单模型，即同一个 `deployment_name` 应该存在于所有已配置 Resource 中。
 
-## 6. 运行同步部署
+## 6. 选择模型配置的权威来源
 
-### 6.1 登录并选择 AKS 所在订阅
+本方案支持两种模型管理方式，但建议只选择一种作为长期权威来源。
+
+### 方式 A：GitOps / 部署脚本管理
+
+继续维护 `azure-openai.loc.json`，然后运行部署脚本。优点是配置可审阅、可重复部署；缺点是每次新增模型都需要修改文件并触发 Pod 更新。
+
+### 方式 B：LiteLLM Admin UI / 数据库管理
+
+先通过部署环境变量开启：
+
+```powershell
+$env:STORE_MODEL_IN_DB = "true"
+python .\deploy_mi_aks_litellm.py
+```
+
+之后可以在 Admin UI 的 Model Management 中直接新增、更新或删除模型，也可以修改 Router Settings。模型和路由设置保存在 PostgreSQL，并动态加入 Router，不需要为了已有 Foundry Resource 中的新 deployment 重新运行部署脚本。
+
+UI 中添加 Azure OpenAI deployment 时至少填写：
+
+```text
+Model Name      = 客户端调用别名
+LiteLLM Model   = azure/<Foundry deployment name>
+API Base        = https://<resource-name>.openai.azure.com/
+API Version     = 2025-04-01-preview（以模型实际要求为准）
+Base Model      = 底层模型名称（用于成本和能力识别）
+```
+
+如果新 deployment 位于一个新的 Azure OpenAI Resource，UI 不会自动为 AKS Managed Identity 分配 Azure RBAC。必须先手工授予 `Cognitive Services OpenAI User`，或者把新 Resource 加入 JSON 后运行脚本完成授权，再由 UI 管理模型。
+
+不要把同一条 deployment 同时写入 JSON 和 UI。LiteLLM 会合并 ConfigMap/YAML 模型与数据库模型，而不是自动去重或双向同步；混合管理可能形成重复后端。数据库中的同名 Router Settings 会覆盖 YAML 中的值。
+
+## 7. 运行同步部署（GitOps 方式）
+
+### 7.1 登录并选择 AKS 所在订阅
 
 ```powershell
 az login
@@ -226,7 +259,7 @@ $env:AZURE_SUBSCRIPTION_ID = "<AKS_SUBSCRIPTION_ID>"
 
 两者可以相同，也可以不同。
 
-### 6.2 运行 LiteLLM 部署脚本
+### 7.2 运行 LiteLLM 部署脚本
 
 ```powershell
 cd C:\path\to\break-aoai-quota\LiteLLM
@@ -247,7 +280,7 @@ python .\deploy_mi_aks_litellm.py .\azure-openai.json
 
 部署脚本会把配置文件的 SHA-256 hash 写入 LiteLLM Pod Template annotation。只要 deployment_list 或 zure-openai-list 变化，Kubernetes 就会自动创建新 Pod，加载最新模型列表。
 
-## 7. 验证新模型是否同步成功
+## 8. 验证新模型是否同步成功
 
 先获取 LoadBalancer 地址：
 
@@ -302,9 +335,9 @@ python .\tests\test_all_deployments.py `
 
 Windows 默认 `cp1252` 控制台可能无法输出中文 prompt，测试时使用 `--prompt ok` 可以避免输出编码问题。
 
-## 8. 常见问题
+## 9. 常见问题
 
-### 8.1 返回 deployment not found
+### 9.1 返回 deployment not found
 
 通常原因：
 
@@ -315,7 +348,7 @@ Windows 默认 `cp1252` 控制台可能无法输出中文 prompt，测试时使�
 
 先用 Azure CLI 查看真实 deployment name，再逐项对照 JSON。
 
-### 8.2 新模型没有出现在 `/v1/models`
+### 9.2 新模型没有出现在 `/v1/models`
 
 检查：
 
@@ -335,7 +368,7 @@ kubectl get pods -n litellm
 kubectl logs deployment/litellm-mi-proxy -n litellm --tail=100
 ```
 
-### 8.3 Foundry Project 名称能不能直接填到 azure-openai-list
+### 9.3 Foundry Project 名称能不能直接填到 azure-openai-list
 
 不能直接填。当前脚本需要的是 Azure OpenAI Resource 的 endpoint：
 
@@ -345,11 +378,11 @@ https://<resource-name>.openai.azure.com/
 
 Project 名称、Managed Compute endpoint 和 Azure OpenAI Resource 名称不是同一个维度。
 
-### 8.4 新模型需要修改 api_version 吗
+### 9.4 新模型需要修改 api_version 吗
 
 当前脚本对所有模型默认生成 `2025-04-01-preview`。如果新模型需要特定 API version，需要扩展 `generate_litellm_config()`，让每个 deployment 可以配置独立的 `api_version`，而不是只根据模型名称统一设置。
 
-## 9. 删除或下线模型
+## 10. 删除或下线模型
 
 从 `deployment_list` 删除模型并重新运行部署脚本，只会让 LiteLLM 不再生成该模型的路由；它不会自动删除 Azure AI Foundry 中已经存在的 deployment。
 

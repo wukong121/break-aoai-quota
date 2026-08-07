@@ -48,6 +48,15 @@ Each `azure-openai-list[].subscription_id` is used to grant the Managed Identity
 
 ## User budgets and model access
 
+To add models or edit Router Settings from the Admin UI, enable database-backed configuration before deploying:
+
+```powershell
+$env:STORE_MODEL_IN_DB = "true"
+python .\deploy_mi_aks_litellm.py
+```
+
+The variable must be injected into the AKS pod; setting it only in a local shell does not change an already running proxy. UI-managed models and router settings persist in PostgreSQL. Avoid managing the same deployment from both the UI database and `azure-openai*.json`, which can create duplicate routes or configuration drift.
+
 Open:
 
 ```text

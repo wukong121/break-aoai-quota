@@ -56,6 +56,26 @@ from kubernetes.client.rest import ApiException
 # Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
 
+SUPPORTED_AFFINITY_CHECKS = {
+    "responses_api_deployment_check",
+    "deployment_affinity",
+    "session_affinity",
+}
+
+
+def parse_affinity_checks(value: str) -> list[str]:
+    """Parse and validate comma-separated router affinity checks."""
+    checks = list(dict.fromkeys(item.strip() for item in value.split(",") if item.strip()))
+    unsupported = sorted(set(checks) - SUPPORTED_AFFINITY_CHECKS)
+    if unsupported:
+        raise ValueError(
+            "Unsupported LITELLM_AFFINITY_CHECKS value(s): "
+            f"{', '.join(unsupported)}. Supported values: "
+            f"{', '.join(sorted(SUPPORTED_AFFINITY_CHECKS))}"
+        )
+    return checks
+
+
 DEFAULT_CONFIG = {
     "mi_name": os.environ.get("MI_NAME", "litellm-managed-identity"),
     "aks_name": os.environ.get("AKS_NAME", "litellm-mi-aks"),
@@ -65,6 +85,16 @@ DEFAULT_CONFIG = {
     "litellm_image": os.environ.get("LITELLM_IMAGE", "micl/litellm:mi-fix-image-gen"),
     "litellm_master_key": os.environ.get("LITELLM_MASTER_KEY", "").strip(),
     "auto_generate_master_key": os.environ.get("AUTO_GENERATE_MASTER_KEY", "true").lower() == "true",
+    "store_model_in_db": os.environ.get("STORE_MODEL_IN_DB", "false").lower() == "true",
+    "affinity_checks": parse_affinity_checks(
+        os.environ.get(
+            "LITELLM_AFFINITY_CHECKS",
+            "responses_api_deployment_check,deployment_affinity,session_affinity",
+        )
+    ),
+    "deployment_affinity_ttl_seconds": int(
+        os.environ.get("DEPLOYMENT_AFFINITY_TTL_SECONDS", "3600")
+    ),
     "litellm_startup_wait_seconds": int(os.environ.get("LITELLM_STARTUP_WAIT_SECONDS", "180")),
     "ingress_proxy_body_size": os.environ.get("INGRESS_PROXY_BODY_SIZE", "100m").strip() or "100m",
     "ingress_proxy_buffering": os.environ.get("INGRESS_PROXY_BUFFERING", "off").strip() or "off",
@@ -345,10 +375,16 @@ class AzureResourceManager:
         log(f"Assigning user-assigned MI to AKS node VMSS: {vmss_name}")
         vmss = self.compute_client.virtual_machine_scale_sets.get(resource_group, vmss_name)
 
-        # Prepare identity update
         user_identities = vmss.identity.user_assigned_identities or {} if vmss.identity else {}
-        if identity_resource_id not in user_identities:
-            user_identities[identity_resource_id] = {}
+        normalized_identity_id = identity_resource_id.rstrip("/").lower()
+        attached_identity_ids = {
+            resource_id.rstrip("/").lower() for resource_id in user_identities
+        }
+        if normalized_identity_id in attached_identity_ids:
+            log(f"Managed identity is already attached to VMSS: {vmss_name}")
+            return
+
+        user_identities[identity_resource_id] = {}
 
         identity_type = "SystemAssigned, UserAssigned" if vmss.identity and vmss.identity.type == "SystemAssigned" else "UserAssigned"
 
@@ -607,8 +643,11 @@ class KubernetesManager:
 # LiteLLM Config Generation
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def generate_litellm_config(cfg: dict[str, Any]) -> str:
+def generate_litellm_config(
+    cfg: dict[str, Any], settings: Optional[dict[str, Any]] = None
+) -> str:
     """Generate LiteLLM configuration YAML."""
+    settings = settings or DEFAULT_CONFIG
     resources = cfg["azure-openai-list"]
     deployments = cfg["deployment_list"]
 
@@ -651,6 +690,10 @@ def generate_litellm_config(cfg: dict[str, Any]) -> str:
         "router_settings": {
             "routing_strategy": "simple-shuffle",
             "num_retries": 2,
+            "optional_pre_call_checks": settings["affinity_checks"],
+            "deployment_affinity_ttl_seconds": settings[
+                "deployment_affinity_ttl_seconds"
+            ],
         },
     }
 
@@ -1028,7 +1071,7 @@ def main():
             log(f"Role already assigned on: {aoai_name}")
 
     # Step 7: Generate LiteLLM config
-    litellm_config_yaml = generate_litellm_config(cfg)
+    litellm_config_yaml = generate_litellm_config(cfg, settings)
     config_path = Path(args.config).parent / "litellm.config.yaml"
     with open(config_path, "w", encoding="utf-8") as f:
         f.write(litellm_config_yaml)
@@ -1061,6 +1104,7 @@ def main():
         "AZURE_API_VERSION": settings["azure_api_version"],
         "LITELLM_MASTER_KEY": settings["litellm_master_key"],
         "DATABASE_URL": database_url,
+        "STORE_MODEL_IN_DB": "true" if settings["store_model_in_db"] else "false",
     }
     k8s_mgr.apply_secret("litellm-env", secret_data)
 

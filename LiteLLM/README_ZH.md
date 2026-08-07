@@ -90,6 +90,9 @@ python .\deploy_mi_aks_litellm.py .\customer-a.loc.json
 | `LITELLM_IMAGE` | `micl/litellm:mi-fix-image-gen` | LiteLLM 容器镜像；客户部署应显式指定可拉取镜像 |
 | `LITELLM_MASTER_KEY` | 空 | 管理员 Key，至少 24 个字符；为空时按下一项决定是否生成 |
 | `AUTO_GENERATE_MASTER_KEY` | `true` | Master Key 为空时是否自动生成；设为 `false` 可强制要求外部注入 |
+| `STORE_MODEL_IN_DB` | `false` | 设为 `true` 后允许通过 Admin UI/API 持久化管理模型和 Router Settings；配置保存在 PostgreSQL |
+| `LITELLM_AFFINITY_CHECKS` | `responses_api_deployment_check,deployment_affinity,session_affinity` | Responses API 会话亲和检查；逗号分隔，设为空可关闭 |
+| `DEPLOYMENT_AFFINITY_TTL_SECONDS` | `3600` | Session ID / Virtual Key 亲和映射的 TTL（秒） |
 | `LITELLM_STARTUP_WAIT_SECONDS` | `180` | 等待 Prisma migration 和 Uvicorn 启动的秒数 |
 | `LITELLM_HOSTNAME` | 空 | 域名；非空时启用 Ingress + HTTPS，否则使用公网 `LoadBalancer:4000` |
 | `LETSENCRYPT_EMAIL` | 空 | 启用域名时必填的 Let's Encrypt 邮箱 |
@@ -122,6 +125,15 @@ $env:AKS_VM_SIZE = "Standard_B2ms"
 
 ## 🔐 用户预算和模型权限
 
+如果需要在 Admin UI 中新增模型或修改 Router Settings，部署前启用数据库配置存储：
+
+```powershell
+$env:STORE_MODEL_IN_DB = "true"
+python .\deploy_mi_aks_litellm.py
+```
+
+该变量必须进入 AKS Pod；只在本机设置但不重新运行脚本，不会影响已经运行的 LiteLLM。启用后，UI 模型与路由设置保存在 PostgreSQL，重启 Pod 后仍然存在。不要长期同时用 UI 数据库和 `azure-openai*.json` 管理同一条模型 Deployment，否则可能出现重复或配置漂移。
+
 部署完成后，打开：
 
 ```text
@@ -136,6 +148,8 @@ http://<AKS LoadBalancer IP>:4000/ui
 - 用户和 Team 的用量统计。
 
 详细步骤见 [`USER_BUDGET_AND_MODEL_ACCESS_ZH.md`](./USER_BUDGET_AND_MODEL_ACCESS_ZH.md)。
+
+多 Foundry Resource 下的 Responses API 会话亲和配置见 [`SESSION_AFFINITY_ROUTING_ZH.md`](./SESSION_AFFINITY_ROUTING_ZH.md)。
 
 ## 🧪 验证部署
 
