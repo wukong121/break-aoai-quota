@@ -9,6 +9,7 @@
 - `azure-openai.loc.json`: 本机实际部署配置（已被 `.gitignore` 忽略，不要提交）。
 - `USER_BUDGET_AND_MODEL_ACCESS_ZH.md`: 用户、Team、Virtual Key、预算和模型权限配置指南。
 - FOUNDRY_MODEL_SYNC_ZH.md: Foundry 新增模型 deployment 后同步到 LiteLLM 的操作指南。
+- `RESOURCE_CLEANUP_ZH.md`: 删除脚本创建/修改的 AKS、Managed Identity、RBAC 和 Kubernetes 资源，并验证无残留。
 - `litellm.config.yaml`: 部署脚本根据 JSON 自动生成的 LiteLLM 配置，不建议手工修改。
 
 *注：测试与依赖项已整合至项目根目录 (`../tests/` 与 `../requirements.txt`)。*
@@ -49,8 +50,8 @@ $env:AKS_NAME = "litellm-mi-aks"
 $env:AKS_VM_SIZE = "Standard_D2s_v3"
 $env:AKS_NODE_COUNT = "1"
 
-# 必须改成 AKS 能拉取的镜像；私有 ACR 还需提前授予 AKS AcrPull 权限
-$env:LITELLM_IMAGE = "<acr-name>.azurecr.io/litellm:<tag>"
+# 可选：覆盖默认的官方 LiteLLM 1.95.0 镜像；私有 ACR 需提前授予 AKS AcrPull 权限
+$env:LITELLM_IMAGE = "<acr-name>.azurecr.io/litellm:1.95.0"
 
 # 生产环境建议固定注入；至少 24 个字符，不要提交到 Git
 $env:LITELLM_MASTER_KEY = "sk-<强随机密钥>"
@@ -87,7 +88,7 @@ python .\deploy_mi_aks_litellm.py .\customer-a.loc.json
 | `AKS_NODE_COUNT` | `1` | AKS 节点数 |
 | `AKS_VM_SIZE` | `Standard_D2s_v3` | AKS 节点规格 |
 | `AKS_NAMESPACE` | `litellm` | Kubernetes namespace |
-| `LITELLM_IMAGE` | `micl/litellm:mi-fix-image-gen` | LiteLLM 容器镜像；客户部署应显式指定可拉取镜像 |
+| `LITELLM_IMAGE` | `docker.litellm.ai/berriai/litellm:1.95.0` | LiteLLM 官方容器镜像；生产环境可导入客户 ACR 后显式覆盖 |
 | `LITELLM_MASTER_KEY` | 空 | 管理员 Key，至少 24 个字符；为空时按下一项决定是否生成 |
 | `AUTO_GENERATE_MASTER_KEY` | `true` | Master Key 为空时是否自动生成；设为 `false` 可强制要求外部注入 |
 | `STORE_MODEL_IN_DB` | `false` | 设为 `true` 后允许通过 Admin UI/API 持久化管理模型和 Router Settings；配置保存在 PostgreSQL |
@@ -151,6 +152,10 @@ http://<AKS LoadBalancer IP>:4000/ui
 
 多 Foundry Resource 下的 Responses API 会话亲和配置见 [`SESSION_AFFINITY_ROUTING_ZH.md`](./SESSION_AFFINITY_ROUTING_ZH.md)。
 
+默认的 LiteLLM `1.95.0` 镜像已实测通过 HTTPS API Key 认证（HTTP 200）和 Responses WebSocket 握手（HTTP 101）。迁移自 `micl/litellm:mi-fix-image-gen` 时，还应单独回归 Azure image generation 的 Managed Identity 认证；旧镜像包含的相关自定义补丁不能假定已由新版完整覆盖。详见 [`IMAGE_PULL_SOLUTION_ZH.md`](./IMAGE_PULL_SOLUTION_ZH.md)。
+
+使用真实 Codex 推理和 ingress `101` 日志验证 WebSocket 链路，见 [`CODEX_LITELLM_WEBSOCKET_VALIDATION_ZH.md`](./CODEX_LITELLM_WEBSOCKET_VALIDATION_ZH.md)。
+
 ## 🧪 验证部署
 
 实际测试脚本文件是 `../tests/test_all_deployments.py`：
@@ -178,7 +183,7 @@ python ..\tests\test_all_deployments.py `
 ```powershell
 $env:LITELLM_HOSTNAME = "litellm.example.com"   # 触发 Ingress 模式
 $env:LETSENCRYPT_EMAIL = "you@example.com"       # Let's Encrypt 证书邮箱（必填）
-$env:LITELLM_IMAGE = "<acr-name>.azurecr.io/litellm:<tag>"
+$env:LITELLM_IMAGE = "<acr-name>.azurecr.io/litellm:1.95.0"
 $env:LITELLM_MASTER_KEY = "sk-<强随机密钥>"
 python .\deploy_mi_aks_litellm.py
 ```

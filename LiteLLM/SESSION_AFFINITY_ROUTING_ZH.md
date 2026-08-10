@@ -172,7 +172,7 @@ kubectl rollout status deployment/litellm-mi-proxy -n litellm --timeout=10m
 
 ## 使用 Codex CLI 做端到端验证
 
-当前自定义镜像不支持 Responses WebSocket，Codex Provider 建议显式使用 HTTP Responses：
+默认的 LiteLLM `1.95.0` 镜像已实测支持 Responses WebSocket 握手（HTTP 101），Codex Provider 可以启用 WebSocket：
 
 ```toml
 [model_providers.litellm]
@@ -180,8 +180,10 @@ name = "LiteLLM"
 base_url = "https://litellm.wangpeter.asia/v1"
 env_key = "LITELLM_API_KEY"
 wire_api = "responses"
-supports_websockets = false
+supports_websockets = true
 ```
+
+如果临时回退到旧的 `micl/litellm:mi-fix-image-gen` 镜像，则应重新设为 `false`，让 Codex 使用 HTTP Responses。
 
 ### 1. 在本机终端设置 Virtual Key
 

@@ -1,16 +1,48 @@
-# LiteLLM 修复镜像拉取问题解决方案
+# LiteLLM 官方镜像拉取与旧修复镜像迁移说明
 
 ## 背景与问题本质
 
-本项目部署默认使用的镜像是 **`micl/litellm:mi-fix-image-gen`**（Docker Hub 上的私有修复版，基于 litellm `1.81.16` 从源码 fork 构建）。
+本项目当前默认使用官方镜像 **`docker.litellm.ai/berriai/litellm:1.95.0`**。该版本已实测通过 HTTPS API Key 认证（HTTP 200）及 Responses WebSocket 握手（HTTP 101）。
 
 镜像默认值在 [`deploy_mi_aks_litellm.py`](deploy_mi_aks_litellm.py) 中，可用环境变量 `LITELLM_IMAGE` 覆盖：
 
 ```python
-"litellm_image": os.environ.get("LITELLM_IMAGE", "micl/litellm:mi-fix-image-gen"),
+"litellm_image": os.environ.get(
+  "LITELLM_IMAGE", "docker.litellm.ai/berriai/litellm:1.95.0"
+),
 ```
 
-这个修复版专门绕开了 **Codex Desktop 走 Responses API（`wire_api = "responses"`）时 Azure OpenAI 返回的 `image_gen` 命名空间冲突**：
+此前默认的 **`micl/litellm:mi-fix-image-gen`** 是基于 LiteLLM `1.81.16` 构建的个人 fork。下面保留其取证结果，用于说明升级到官方镜像后仍需回归的行为，不再建议将该不可追溯镜像用于新部署。
+
+对运行镜像 `sha256:9473d7409f5afab2851e08a56af1b1df3ac28492bb0b0b156f467952dccb438f` 与 LiteLLM `1.81.16` 基线进行源码对比后，能够确认的核心修复是：**Azure image generation 使用 Managed Identity 时，为底层 raw HTTP 请求补上 Entra Bearer Token**。
+
+普通 Azure SDK 调用会在客户端内部处理 `azure_ad_token_provider`；但该版本的 image generation 路径最终调用 raw `httpx`。官方基线虽然在 `initialize_azure_sdk_client()` 中解析出了 Managed Identity Token Provider，却没有把 token 写入 raw HTTP 请求头，导致不使用 API Key 的 image generation 请求无法完成 Azure 认证。
+
+自定义 fork 在 `litellm/llms/azure/azure.py` 中增加了以下逻辑：
+
+```python
+if api_key is None and "Authorization" not in headers:
+    resolved_provider = azure_client_params.get("azure_ad_token_provider")
+    resolved_token = azure_client_params.get("azure_ad_token")
+    if resolved_provider is not None and resolved_token is None:
+        resolved_token = resolved_provider()
+    if resolved_token:
+        headers.pop("api-key", None)
+        headers["Authorization"] = f"Bearer {resolved_token}"
+```
+
+处理流程为：
+
+```text
+ManagedIdentityCredential
+  -> initialize_azure_sdk_client() 解析 Token Provider
+  -> 自定义补丁调用 Token Provider
+  -> 删除空的 api-key header
+  -> 写入 Authorization: Bearer <Entra Token>
+  -> raw httpx image generation 请求通过 Azure RBAC 认证
+```
+
+项目曾观察到 Codex Desktop 走 Responses API 时的 `image_gen` namespace 错误：
 
 ```text
 litellm.BadRequestError: AzureException BadRequestError - {
@@ -23,14 +55,15 @@ litellm.BadRequestError: AzureException BadRequestError - {
 }. Received Model Group=gpt-5.6-sol
 ```
 
-> **关键结论：官方镜像没有这个补丁。** 把镜像换成官方 `ghcr.io/berriai/litellm` 会复现上面的 `BadRequestError`。
-> 因此不能换官方镜像 —— 必须让客户能拉取这个**修复镜像**。问题从“要不要换镜像”变成了“**如何把修复镜像送进客户能拉取的仓库**”。
+但当前取证没有发现镜像对 `image_gen` namespace 做重命名、删除或改写：Azure Responses 转换仍会原样透传 `type=namespace, name=image_gen`。因此不能再把 namespace collision 的消失直接归因于该镜像补丁，它还可能受到 Codex 版本、模型能力、Azure 后端行为或请求中是否同时包含内置 `image_generation` 工具的影响。
+
+> **迁移结论：** Responses WebSocket 已在官方 `1.95.0` 镜像上验证通过。Azure image generation 的 Managed Identity 认证仍需单独执行端到端回归；若新版仍缺失该行为，应在 `1.95.0` 明确源码基线上重放最小认证补丁，而不是继续依赖不可追溯的个人镜像。
 
 ### 客户拉不到镜像的常见原因
 
 - 企业网络禁止访问 Docker Hub
 - 只允许白名单/受信任的镜像仓库
-- `micl` 这类个人 namespace 不被安全策略信任
+- 镜像域名不在企业网络白名单中
 - 集群无公网出口
 
 ---
@@ -82,8 +115,8 @@ az acr create -g $rg -n $acr --sku Basic -l $loc
 ```powershell
 az acr import `
   --name $acr `
-  --source docker.io/micl/litellm:mi-fix-image-gen `
-  --image litellm:mi-fix-image-gen
+  --source docker.litellm.ai/berriai/litellm:1.95.0 `
+  --image litellm:1.95.0
 ```
 
 ### 步骤 3：给 AKS 授 AcrPull 权限
@@ -97,7 +130,7 @@ az aks update -g <客户RG> -n <客户AKS> --attach-acr $acr
 ### 步骤 4：用新镜像地址重新部署
 
 ```powershell
-$env:LITELLM_IMAGE = "$acr.azurecr.io/litellm:mi-fix-image-gen"
+$env:LITELLM_IMAGE = "$acr.azurecr.io/litellm:1.95.0"
 python LiteLLM/deploy_mi_aks_litellm.py
 ```
 
@@ -107,40 +140,40 @@ python LiteLLM/deploy_mi_aks_litellm.py
 
 ## 方案 B：从能联网的机器中转推送
 
-如果连 `az acr import` 都被策略拦截（极少见），在**能拉取 Docker Hub 的机器**上中转：
+如果连 `az acr import` 都被策略拦截（极少见），在**能访问 LiteLLM 官方镜像仓库的机器**上中转：
 
 ```powershell
-docker pull docker.io/micl/litellm:mi-fix-image-gen
-docker tag  docker.io/micl/litellm:mi-fix-image-gen $acr.azurecr.io/litellm:mi-fix-image-gen
+docker pull docker.litellm.ai/berriai/litellm:1.95.0
+docker tag  docker.litellm.ai/berriai/litellm:1.95.0 $acr.azurecr.io/litellm:1.95.0
 az acr login -n $acr
-docker push $acr.azurecr.io/litellm:mi-fix-image-gen
+docker push $acr.azurecr.io/litellm:1.95.0
 ```
 
 **完全离线**场景：
 
 ```powershell
-docker save docker.io/micl/litellm:mi-fix-image-gen -o litellm-fix.tar
-# 通过 U盘/内网把 litellm-fix.tar 传给客户，然后在客户环境：
-docker load -i litellm-fix.tar
-docker tag  docker.io/micl/litellm:mi-fix-image-gen <客户registry>/litellm:mi-fix-image-gen
-docker push <客户registry>/litellm:mi-fix-image-gen
+docker save docker.litellm.ai/berriai/litellm:1.95.0 -o litellm-1.95.0.tar
+# 通过 U盘/内网把 tar 文件传给客户，然后在客户环境：
+docker load -i litellm-1.95.0.tar
+docker tag  docker.litellm.ai/berriai/litellm:1.95.0 <客户registry>/litellm:1.95.0
+docker push <客户registry>/litellm:1.95.0
 ```
 
 同样适用于客户内网自建仓库（Harbor 等）。
 
 ---
 
-## 方案 C（长期解）：在官方镜像上重建补丁
+## 方案 C：仅在 MI 图像生成回归失败时重建补丁
 
-彻底摆脱对 `micl` 这个不透明私有镜像的依赖 —— 用一个基于官方镜像的 `Dockerfile` 把修复重新打上去，镜像放客户自己的 registry，以后自行维护：
+如果官方 `1.95.0` 的 Azure image generation Managed Identity 端到端测试失败，再基于这个明确版本重放最小补丁，并将结果放入客户自己的 registry：
 
 ```dockerfile
-FROM ghcr.io/berriai/litellm:v1.81.16
-# 应用 image_gen 命名空间冲突修复补丁
-# COPY patched_file.py /usr/lib/python3.13/site-packages/litellm/...
+FROM docker.litellm.ai/berriai/litellm:1.95.0
+# 应用 Azure image generation Managed Identity 认证补丁
+# COPY patched_azure.py /usr/lib/python3.13/site-packages/litellm/llms/azure/azure.py
 ```
 
-前提是拿到确切补丁 diff。修复并非简单的文件级 patch（整个 litellm 是从 fork 源码重建，无法用文件修改时间区分），需要将修复镜像内的 litellm 源码与官方 `pip` 版 `1.81.16` 逐文件 diff 才能精确还原。
+建议不要覆盖整个 `azure.py`，而是在选定的新版官方源码上重放上文 Bearer Token 注入逻辑并增加回归测试。运行镜像相对 `1.81.16` 基线还有数十个其他源码差异，因此镜像整体不能被视为只有一个干净补丁；重建时只迁移经过验证且仍未被上游修复的最小逻辑。
 
 ---
 
@@ -156,7 +189,7 @@ FROM ghcr.io/berriai/litellm:v1.81.16
 |---|---|---|
 | **A. `az acr import` 进客户 ACR** | 客户有/可建 ACR，网络禁 Docker Hub | ⭐⭐⭐⭐⭐ 首选 |
 | **B. 中转/离线推送** | 连 `acr import` 都被拦，或完全离线 | ⭐⭐⭐⭐ |
-| **C. 官方镜像重建补丁** | 想彻底自给自足、长期维护 | ⭐⭐⭐ 长期解 |
+| **C. 官方镜像重建补丁** | 仅 MI 图像生成回归失败 | ⭐⭐ 条件性方案 |
 | **D. imagePullSecrets** | 仅 Docker Hub 限速/登录问题 | ⭐ 兜底 |
 
 ---
@@ -187,15 +220,15 @@ do {
 
 az acr create -g $rg -n $acr --sku Basic -l $loc
 
-# 2. 服务端导入修复镜像
+# 2. 服务端导入官方 LiteLLM 1.95.0 镜像
 az acr import --name $acr `
-  --source docker.io/micl/litellm:mi-fix-image-gen `
-  --image litellm:mi-fix-image-gen
+  --source docker.litellm.ai/berriai/litellm:1.95.0 `
+  --image litellm:1.95.0
 
 # 3. 授权 AKS 拉取
 az aks update -g $rg -n $aks --attach-acr $acr
 
 # 4. 用新镜像重新部署
-$env:LITELLM_IMAGE = "$acr.azurecr.io/litellm:mi-fix-image-gen"
+$env:LITELLM_IMAGE = "$acr.azurecr.io/litellm:1.95.0"
 python LiteLLM/deploy_mi_aks_litellm.py
 ```

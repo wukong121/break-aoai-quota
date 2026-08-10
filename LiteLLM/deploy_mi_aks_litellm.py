@@ -82,7 +82,9 @@ DEFAULT_CONFIG = {
     "aks_node_count": int(os.environ.get("AKS_NODE_COUNT", "1")),
     "aks_vm_size": os.environ.get("AKS_VM_SIZE", "Standard_D2s_v3"),
     "aks_namespace": os.environ.get("AKS_NAMESPACE", "litellm"),
-    "litellm_image": os.environ.get("LITELLM_IMAGE", "micl/litellm:mi-fix-image-gen"),
+    "litellm_image": os.environ.get(
+        "LITELLM_IMAGE", "docker.litellm.ai/berriai/litellm:1.95.0"
+    ),
     "litellm_master_key": os.environ.get("LITELLM_MASTER_KEY", "").strip(),
     "auto_generate_master_key": os.environ.get("AUTO_GENERATE_MASTER_KEY", "true").lower() == "true",
     "store_model_in_db": os.environ.get("STORE_MODEL_IN_DB", "false").lower() == "true",

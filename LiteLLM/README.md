@@ -23,10 +23,15 @@ python -m pip install -r .\requirements.txt
 az login
 $env:AZURE_SUBSCRIPTION_ID = "<AKS-subscription-id>"
 
-# 3. Deploy from the LiteLLM directory
+# 3. Optionally override the default LiteLLM 1.95.0 image
+$env:LITELLM_IMAGE = "<acr-name>.azurecr.io/litellm:1.95.0"
+
+# 4. Deploy from the LiteLLM directory
 cd .\LiteLLM
 python .\deploy_mi_aks_litellm.py
 ```
+
+The default image is `docker.litellm.ai/berriai/litellm:1.95.0`. It has been verified with API-key-authenticated HTTPS (HTTP 200) and a Responses WebSocket upgrade (HTTP 101). When migrating from `micl/litellm:mi-fix-image-gen`, separately regression-test Managed Identity authentication for Azure image generation because the legacy image contained a custom Bearer-token patch for that path.
 
 The script creates or reuses the Resource Group, Managed Identity, and AKS cluster named by the configuration. In the LiteLLM configuration, `apim_resource_group` is a legacy field name: it means the AKS/Managed Identity Resource Group, not an APIM Resource Group.
 
