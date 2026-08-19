@@ -221,3 +221,6 @@ LiteLLM/azure-openai.loc.json
 
 # Docs
 docs/
+
+# Temporary local artifacts
+temp/

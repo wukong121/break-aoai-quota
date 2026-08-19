@@ -10,6 +10,7 @@
 - `USER_BUDGET_AND_MODEL_ACCESS_ZH.md`: 用户、Team、Virtual Key、预算和模型权限配置指南。
 - FOUNDRY_MODEL_SYNC_ZH.md: Foundry 新增模型 deployment 后同步到 LiteLLM 的操作指南。
 - `RESOURCE_CLEANUP_ZH.md`: 删除脚本创建/修改的 AKS、Managed Identity、RBAC 和 Kubernetes 资源，并验证无残留。
+- `CODEX_0147_EMPTY_FUNCTIONS_DESCRIPTION_WORKAROUND_ZH.md`: Codex 0.147 Responses Lite 空 namespace description 的 LiteLLM Custom Callback 兼容方案。
 - `litellm.config.yaml`: 部署脚本根据 JSON 自动生成的 LiteLLM 配置，不建议手工修改。
 
 *注：测试与依赖项已整合至项目根目录 (`../tests/` 与 `../requirements.txt`)。*
