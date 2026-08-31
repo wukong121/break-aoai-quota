@@ -220,7 +220,13 @@ APIM/azure-openai.loc.json
 LiteLLM/azure-openai.loc.json
 
 # Docs
-docs/
+docs/*
+!docs/litellm-azure-security-hardening-zh.md
+!docs/litellm-security-hardening-change-list-zh.md
+!docs/litellm-bom-cost-comparison-zh.md
 
 # Temporary local artifacts
 temp/
+
+# Local database backups
+*.dump
