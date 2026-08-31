@@ -8,6 +8,7 @@ import yaml
 
 from LiteLLM.deploy_mi_aks_litellm import (
     AzureResourceManager,
+    KubernetesManager,
     build_litellm_deployment,
     generate_litellm_config,
     get_subscription_id,
@@ -64,6 +65,39 @@ class SubscriptionSelectionTests(unittest.TestCase):
         self.assertEqual(
             generated["router_settings"]["deployment_affinity_ttl_seconds"],
             1800,
+        )
+        self.assertEqual(
+            generated["general_settings"]["maximum_spend_logs_retention_period"],
+            "7d",
+        )
+        self.assertEqual(
+            generated["general_settings"]["maximum_spend_logs_retention_interval"],
+            "1d",
+        )
+        self.assertFalse(
+            generated["general_settings"]["store_prompts_in_spend_logs"]
+        )
+
+    def test_existing_pvc_expands_only_when_enabled(self):
+        manager = KubernetesManager.__new__(KubernetesManager)
+        manager.namespace = "litellm"
+        manager.core_v1 = Mock()
+        manager.core_v1.read_namespaced_persistent_volume_claim.return_value = (
+            SimpleNamespace(
+                spec=SimpleNamespace(
+                    resources=SimpleNamespace(requests={"storage": "1Gi"})
+                )
+            )
+        )
+
+        manager.apply_pvc("pg-data", "20Gi")
+        manager.core_v1.patch_namespaced_persistent_volume_claim.assert_not_called()
+
+        manager.apply_pvc("pg-data", "20Gi", expand_existing=True)
+        manager.core_v1.patch_namespaced_persistent_volume_claim.assert_called_once_with(
+            "pg-data",
+            "litellm",
+            {"spec": {"resources": {"requests": {"storage": "20Gi"}}}},
         )
 
     def test_litellm_deployment_rolls_when_config_hash_changes(self):

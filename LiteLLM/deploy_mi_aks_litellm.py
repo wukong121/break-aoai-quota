@@ -50,6 +50,7 @@ from azure.mgmt.containerservice.models import (
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 from kubernetes.client.rest import ApiException
+from kubernetes.utils.quantity import parse_quantity
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -88,6 +89,16 @@ DEFAULT_CONFIG = {
     "litellm_master_key": os.environ.get("LITELLM_MASTER_KEY", "").strip(),
     "auto_generate_master_key": os.environ.get("AUTO_GENERATE_MASTER_KEY", "true").lower() == "true",
     "store_model_in_db": os.environ.get("STORE_MODEL_IN_DB", "false").lower() == "true",
+    "disable_spend_logs": os.environ.get("DISABLE_SPEND_LOGS", "false").lower() == "true",
+    "store_prompts_in_spend_logs": os.environ.get(
+        "STORE_PROMPTS_IN_SPEND_LOGS", "false"
+    ).lower() == "true",
+    "spend_logs_retention_period": os.environ.get(
+        "MAXIMUM_SPEND_LOGS_RETENTION_PERIOD", "7d"
+    ).strip(),
+    "spend_logs_retention_interval": os.environ.get(
+        "MAXIMUM_SPEND_LOGS_RETENTION_INTERVAL", "1d"
+    ).strip(),
     "affinity_checks": parse_affinity_checks(
         os.environ.get(
             "LITELLM_AFFINITY_CHECKS",
@@ -109,7 +120,10 @@ DEFAULT_CONFIG = {
     "pg_user": os.environ.get("PG_USER", "litellm"),
     "pg_password": os.environ.get("PG_PASSWORD", "litellm-local-dev"),
     "pg_db": os.environ.get("PG_DB", "litellm"),
-    "pg_storage": os.environ.get("PG_STORAGE", "1Gi"),
+    "pg_storage": os.environ.get("PG_STORAGE", "20Gi"),
+    "expand_existing_pg_pvc": os.environ.get(
+        "EXPAND_EXISTING_PG_PVC", "false"
+    ).lower() == "true",
     "litellm_hostname": os.environ.get("LITELLM_HOSTNAME", "").strip(),
     "letsencrypt_email": os.environ.get("LETSENCRYPT_EMAIL", "").strip(),
 }
@@ -505,8 +519,10 @@ class KubernetesManager:
             else:
                 raise
 
-    def apply_pvc(self, name: str, storage: str) -> None:
-        """Create PersistentVolumeClaim if not exists."""
+    def apply_pvc(
+        self, name: str, storage: str, expand_existing: bool = False
+    ) -> None:
+        """Create a PVC, or explicitly expand an existing one."""
         pvc = k8s_client.V1PersistentVolumeClaim(
             metadata=k8s_client.V1ObjectMeta(name=name, namespace=self.namespace),
             spec=k8s_client.V1PersistentVolumeClaimSpec(
@@ -515,7 +531,32 @@ class KubernetesManager:
             ),
         )
         try:
-            self.core_v1.read_namespaced_persistent_volume_claim(name, self.namespace)
+            existing = self.core_v1.read_namespaced_persistent_volume_claim(
+                name, self.namespace
+            )
+            current_storage = existing.spec.resources.requests.get("storage")
+            if current_storage is None or parse_quantity(storage) == parse_quantity(
+                current_storage
+            ):
+                return
+            if parse_quantity(storage) < parse_quantity(current_storage):
+                raise ValueError(
+                    f"Refusing to shrink PVC {name} from {current_storage} to {storage}"
+                )
+            if not expand_existing:
+                log(
+                    f"PVC {name} remains at {current_storage}; set "
+                    "EXPAND_EXISTING_PG_PVC=true to expand it to "
+                    f"{storage}.",
+                    "WARN",
+                )
+                return
+            self.core_v1.patch_namespaced_persistent_volume_claim(
+                name,
+                self.namespace,
+                {"spec": {"resources": {"requests": {"storage": storage}}}},
+            )
+            log(f"Requested PVC expansion: {name} {current_storage} -> {storage}")
         except ApiException as e:
             if e.status == 404:
                 self.core_v1.create_namespaced_persistent_volume_claim(self.namespace, pvc)
@@ -684,11 +725,32 @@ def generate_litellm_config(
                 },
             })
 
+    general_settings = {
+        "disable_spend_logs": settings.get(
+            "disable_spend_logs", DEFAULT_CONFIG["disable_spend_logs"]
+        ),
+        "store_prompts_in_spend_logs": settings.get(
+            "store_prompts_in_spend_logs",
+            DEFAULT_CONFIG["store_prompts_in_spend_logs"],
+        ),
+    }
+    retention_period = settings.get(
+        "spend_logs_retention_period",
+        DEFAULT_CONFIG["spend_logs_retention_period"],
+    )
+    if retention_period:
+        general_settings["maximum_spend_logs_retention_period"] = retention_period
+        general_settings["maximum_spend_logs_retention_interval"] = settings.get(
+            "spend_logs_retention_interval",
+            DEFAULT_CONFIG["spend_logs_retention_interval"],
+        )
+
     config = {
         "model_list": model_list,
         "litellm_settings": {
             "enable_azure_ad_token_refresh": True,
         },
+        "general_settings": general_settings,
         "router_settings": {
             "routing_strategy": "simple-shuffle",
             "num_retries": 2,
@@ -1089,7 +1151,11 @@ def main():
     # PostgreSQL
     log(f"Deploying PostgreSQL in namespace {settings['aks_namespace']}...")
     database_url = f"postgresql://{settings['pg_user']}:{settings['pg_password']}@postgres.{settings['aks_namespace']}.svc.cluster.local:5432/{settings['pg_db']}"
-    k8s_mgr.apply_pvc("pg-data", settings["pg_storage"])
+    k8s_mgr.apply_pvc(
+        "pg-data",
+        settings["pg_storage"],
+        settings["expand_existing_pg_pvc"],
+    )
     k8s_mgr.apply_deployment(build_postgres_deployment(settings["pg_user"], settings["pg_password"], settings["pg_db"]))
     k8s_mgr.apply_service(build_postgres_service())
 

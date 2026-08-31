@@ -70,6 +70,19 @@ http://<AKS LoadBalancer IP>:4000/ui
 
 Use `Internal Users`, `Teams`, and `Virtual Keys` to configure individual budgets, shared team budgets, model allowlists, and spend tracking. See [`USER_BUDGET_AND_MODEL_ACCESS_ZH.md`](./USER_BUDGET_AND_MODEL_ACCESS_ZH.md) for the detailed guide.
 
+## PostgreSQL capacity and spend-log retention
+
+New in-cluster PostgreSQL deployments request a 20 GiB PVC and retain detailed Spend Logs for 7 days. Prompt and response body storage is disabled by default. The relevant environment variables are:
+
+- `PG_STORAGE` (default `20Gi`)
+- `EXPAND_EXISTING_PG_PVC` (default `false`)
+- `MAXIMUM_SPEND_LOGS_RETENTION_PERIOD` (default `7d`)
+- `MAXIMUM_SPEND_LOGS_RETENTION_INTERVAL` (default `1d`)
+- `STORE_PROMPTS_IN_SPEND_LOGS` (default `false`)
+- `DISABLE_SPEND_LOGS` (default `false`)
+
+Changing `PG_STORAGE` does not resize an existing claim unless `EXPAND_EXISTING_PG_PVC=true`. Expansion requires a StorageClass with `allowVolumeExpansion` and cannot be reversed. Back up PostgreSQL first, and securely inject the deployment's existing `LITELLM_MASTER_KEY`, `PG_PASSWORD`, and other environment settings before rerunning the deployment script so the storage change does not rotate credentials. For high-volume production deployments, use Azure Database for PostgreSQL Flexible Server with HA, backups, private networking, and storage growth monitoring instead of the single in-cluster PostgreSQL deployment.
+
 ## Testing
 
 The actual unified test file is `../tests/test_all_deployments.py`:

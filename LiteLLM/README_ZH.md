@@ -10,6 +10,7 @@
 - `USER_BUDGET_AND_MODEL_ACCESS_ZH.md`: 用户、Team、Virtual Key、预算和模型权限配置指南。
 - FOUNDRY_MODEL_SYNC_ZH.md: Foundry 新增模型 deployment 后同步到 LiteLLM 的操作指南。
 - `RESOURCE_CLEANUP_ZH.md`: 删除脚本创建/修改的 AKS、Managed Identity、RBAC 和 Kubernetes 资源，并验证无残留。
+- `POSTGRESQL_CAPACITY_AND_SPEND_LOG_RETENTION_ZH.md`: PostgreSQL 数据影响、PVC 扩容、Spend Logs retention、kubectl 手工修复和脚本修复手册。
 - `CODEX_0147_EMPTY_FUNCTIONS_DESCRIPTION_WORKAROUND_ZH.md`: Codex 0.147 Responses Lite 空 namespace description 的 LiteLLM Custom Callback 兼容方案。
 - `litellm.config.yaml`: 部署脚本根据 JSON 自动生成的 LiteLLM 配置，不建议手工修改。
 
@@ -93,6 +94,10 @@ python .\deploy_mi_aks_litellm.py .\customer-a.loc.json
 | `LITELLM_MASTER_KEY` | 空 | 管理员 Key，至少 24 个字符；为空时按下一项决定是否生成 |
 | `AUTO_GENERATE_MASTER_KEY` | `true` | Master Key 为空时是否自动生成；设为 `false` 可强制要求外部注入 |
 | `STORE_MODEL_IN_DB` | `false` | 设为 `true` 后允许通过 Admin UI/API 持久化管理模型和 Router Settings；配置保存在 PostgreSQL |
+| `DISABLE_SPEND_LOGS` | `false` | 设为 `true` 后不再写入逐请求 Spend Logs；会失去明细审计和部分用量分析能力 |
+| `STORE_PROMPTS_IN_SPEND_LOGS` | `false` | 是否将 Prompt 和 Response 正文写入 Spend Logs；生产环境建议保持关闭 |
+| `MAXIMUM_SPEND_LOGS_RETENTION_PERIOD` | `7d` | Spend Logs 保留期；设为空字符串可关闭自动清理，但不建议用于有限容量 PVC |
+| `MAXIMUM_SPEND_LOGS_RETENTION_INTERVAL` | `1d` | Spend Logs 清理任务执行间隔 |
 | `LITELLM_AFFINITY_CHECKS` | `responses_api_deployment_check,deployment_affinity,session_affinity` | Responses API 会话亲和检查；逗号分隔，设为空可关闭 |
 | `DEPLOYMENT_AFFINITY_TTL_SECONDS` | `3600` | Session ID / Virtual Key 亲和映射的 TTL（秒） |
 | `LITELLM_STARTUP_WAIT_SECONDS` | `180` | 等待 Prisma migration 和 Uvicorn 启动的秒数 |
@@ -109,7 +114,8 @@ python .\deploy_mi_aks_litellm.py .\customer-a.loc.json
 | `PG_USER` | `litellm` | PostgreSQL 用户名 |
 | `PG_PASSWORD` | `litellm-local-dev` | PostgreSQL 密码；生产环境必须覆盖 |
 | `PG_DB` | `litellm` | PostgreSQL 数据库名 |
-| `PG_STORAGE` | `1Gi` | PostgreSQL PVC 容量 |
+| `PG_STORAGE` | `20Gi` | 新建 PostgreSQL PVC 容量；修改该值不会自动扩容已有 PVC |
+| `EXPAND_EXISTING_PG_PVC` | `false` | 设为 `true` 后允许脚本将已有 PG PVC 扩大到 `PG_STORAGE`；不支持缩容 |
 
 默认 AKS 规格为：
 
@@ -152,6 +158,22 @@ http://<AKS LoadBalancer IP>:4000/ui
 详细步骤见 [`USER_BUDGET_AND_MODEL_ACCESS_ZH.md`](./USER_BUDGET_AND_MODEL_ACCESS_ZH.md)。
 
 多 Foundry Resource 下的 Responses API 会话亲和配置见 [`SESSION_AFFINITY_ROUTING_ZH.md`](./SESSION_AFFINITY_ROUTING_ZH.md)。
+
+## PostgreSQL 容量与 Spend Logs
+
+启用数据库后，LiteLLM 会保存 Virtual Key、用户、团队、预算、UI 配置以及逐请求 Spend Logs。调用量较大时，`LiteLLM_SpendLogs` 通常是增长最快的表。默认配置保留 7 天明细，并关闭 Prompt/Response 正文存储。
+
+扩容已有集群前应先备份数据库，并确认 StorageClass 支持 `allowVolumeExpansion`。重跑部署脚本前还必须通过安全方式注入客户当前使用的 `LITELLM_MASTER_KEY`、`PG_PASSWORD` 和其他既有环境变量，避免意外轮换 Key 或覆盖数据库连接配置。例如将现有 PVC 扩到 50 GiB：
+
+```powershell
+$env:PG_STORAGE = "50Gi"
+$env:EXPAND_EXISTING_PG_PVC = "true"
+# 通过安全 Secret 流程注入现有 LITELLM_MASTER_KEY 和 PG_PASSWORD 后再执行
+python .\deploy_mi_aks_litellm.py
+kubectl get pvc pg-data -n litellm
+```
+
+扩容只能增加容量，不能缩小。PostgreSQL 删除过期行后通常会复用空间，但文件系统使用量不一定立即下降。生产环境应设置 PVC 使用率告警；高调用量或有 HA/RTO 要求时，应使用 Azure Database for PostgreSQL Flexible Server，而不是 AKS 内单副本 PostgreSQL。
 
 默认的 LiteLLM `1.95.0` 镜像已实测通过 HTTPS API Key 认证（HTTP 200）和 Responses WebSocket 握手（HTTP 101）。迁移自 `micl/litellm:mi-fix-image-gen` 时，还应单独回归 Azure image generation 的 Managed Identity 认证；旧镜像包含的相关自定义补丁不能假定已由新版完整覆盖。详见 [`IMAGE_PULL_SOLUTION_ZH.md`](./IMAGE_PULL_SOLUTION_ZH.md)。
 
