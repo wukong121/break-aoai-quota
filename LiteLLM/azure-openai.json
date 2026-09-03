@@ -1,0 +1,19 @@
+{
+    "apim_name": "your-apim-name-here",
+    "apim_resource_group": "<your-aks-resource-group>",
+    "region": "<your-azure-region>",
+    "azure-openai-list": [
+        {
+            "name": "<your-azure-openai-resource-name>",
+            "endpoint": "https://<your-azure-openai-resource-name>.openai.azure.com/",
+            "resource_group": "<your-azure-openai-resource-group>",
+            "subscription_id": "<your-azure-subscription-id>"
+        }
+    ],
+    "deployment_list": [
+        {
+            "model": "<your-model-name>",
+            "deployment_name": "<your-model-deployment-name>"
+        }
+    ]
+}
